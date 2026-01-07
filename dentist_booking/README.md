@@ -1,6 +1,6 @@
 # Dentist Booking System
 
-A comprehensive appointment booking system built as a **Phallible Async State Machine (PHASM)** to demonstrate advanced state machine design with deterministic simulation testing.
+A comprehensive appointment booking system built as a **Fallible Async State Machine (FASM)** to demonstrate advanced state machine design with deterministic simulation testing.
 
 ## Features
 
@@ -14,7 +14,7 @@ A comprehensive appointment booking system built as a **Phallible Async State Ma
 
 ## Architecture
 
-This system leverages PHASM's key features:
+This system leverages FASM's key features:
 
 ### Tracked Actions
 - **Payment Preauthorization**: Hold funds, wait for confirmation
@@ -113,7 +113,7 @@ The simulation automatically verifies:
 
 ## Why Simulation Testing?
 
-Building systems as state machines with PHASM enables powerful testing:
+Building systems as state machines with FASM enables powerful testing:
 
 - **Deterministic RNG**: Use seeded random number generators for reproducibility
 - **Property-Based Testing**: Verify invariants after every state transition
@@ -121,7 +121,7 @@ Building systems as state machines with PHASM enables powerful testing:
 - **Crash Scenarios**: Test recovery paths that are hard to trigger manually
 - **Stress Testing**: Saturate system to find capacity limits and race conditions
 
-## Benefits of the PHASM Approach
+## Benefits of the FASM Approach
 
 1. **Correctness**: Invariant checking catches bugs immediately
 2. **Reproducibility**: Seeded RNGs make bugs reproducible
@@ -134,7 +134,7 @@ Building systems as state machines with PHASM enables powerful testing:
 
 ```rust
 use dentist_booking::*;
-use phasm::{Input, StateMachine};
+use fasm::{Input, StateMachine};
 
 let mut system = BookingSystem::with_default_schedule();
 let mut actions = Vec::new();

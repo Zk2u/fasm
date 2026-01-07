@@ -1,8 +1,8 @@
 //! Simple counter state machine example.
 //!
-//! Demonstrates the basic PHASM pattern with the simplified 2024 async syntax.
+//! Demonstrates the basic FASM pattern with the simplified 2024 async syntax.
 
-use phasm::{
+use fasm::{
     Input, StateMachine,
     actions::{Action, ActionsContainer, TrackedActionTypes},
 };

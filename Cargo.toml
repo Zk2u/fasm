@@ -1,10 +1,10 @@
 [package]
-name = "phasm"
+name = "fasm"
 version = "0.3.0"
 edition = "2024"
 authors = ["Azz <zk2u@pm.me>"]
-description = "Phallible Async State Machines"
-repository = "https://github.com/zk2u/phasm"
+description = "Fallible Async State Machines"
+repository = "https://github.com/zk2u/fasm"
 license = "MIT OR Apache-2.0"
 
 [dependencies]

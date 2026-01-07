@@ -6,7 +6,7 @@
 //! - Restore: Recovering pending redemptions after crash
 //! - Atomicity: State unchanged on error
 
-use phasm::{
+use fasm::{
     Input, StateMachine,
     actions::{Action, ActionsContainer, TrackedAction, TrackedActionTypes},
 };

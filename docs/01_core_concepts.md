@@ -1,10 +1,10 @@
-# PHASM Core Concepts
+# FASM Core Concepts
 
-## What is PHASM?
+## What is FASM?
 
-PHASM (Fallible Async State Machines) is a framework for building **deterministic, testable, and crash-recoverable** state machines with async operations and fallible state access.
+FASM (Fallible Async State Machines) is a framework for building **deterministic, testable, and crash-recoverable** state machines with async operations and fallible state access.
 
-## The Problem PHASM Solves
+## The Problem FASM Solves
 
 Traditional state machines assume:
 - State is in-memory and instantly accessible
@@ -16,7 +16,7 @@ In real systems:
 - External systems must be called (async, can fail)
 - Crashes happen mid-transition
 
-PHASM addresses these by:
+FASM addresses these by:
 1. Making fallibility and async first-class
 2. Separating state mutations from external side effects
 3. Enabling deterministic testing and crash recovery
@@ -90,7 +90,7 @@ Rebuilds pending tracked actions from state after crash:
 ## Example: Payment Processing
 
 ```rust
-use phasm::{Input, StateMachine, actions::{Action, ActionsContainer, TrackedAction, TrackedActionTypes}};
+use fasm::{Input, StateMachine, actions::{Action, ActionsContainer, TrackedAction, TrackedActionTypes}};
 use std::collections::HashMap;
 
 // State
@@ -155,13 +155,14 @@ impl StateMachine for PaymentSystem {
     type TrackedAction = PaymentTracked;
     type UntrackedAction = Notification;
     type Actions = Vec<Action<Self::UntrackedAction, Self::TrackedAction>>;
-    type Error = PaymentError;
+    type TransitionError = PaymentError;
+    type RestoreError = ();
 
     async fn stf<'s, 'a>(
         state: &'s mut Self::State,
         input: Input<Self::TrackedAction, Self::Input>,
         actions: &'a mut Self::Actions,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::TransitionError> {
         match input {
             Input::Normal(PaymentInput::ProcessPayment { amount, user }) => {
                 // 1. Prepare values (no mutation yet)
@@ -234,7 +235,7 @@ impl StateMachine for PaymentSystem {
     async fn restore<'s, 'a>(
         state: &'s Self::State,
         actions: &'a mut Self::Actions,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::RestoreError> {
         // Runtime clears actions before calling restore
         for (&payment_id, payment) in &state.pending_payments {
             if payment.status == PaymentStatus::Pending {

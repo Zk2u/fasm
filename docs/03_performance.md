@@ -1,6 +1,6 @@
 # Performance Guide
 
-PHASM state machines can be highly performant when designed correctly. This guide covers optimization strategies.
+FASM state machines can be highly performant when designed correctly. This guide covers optimization strategies.
 
 ## State Storage Performance
 
@@ -334,4 +334,4 @@ This includes:
 - Deterministic RNG
 - Collision detection
 
-**Conclusion**: PHASM state machines can handle millions of operations per second with full correctness checking on modern hardware.
+**Conclusion**: FASM state machines can handle millions of operations per second with full correctness checking on modern hardware.

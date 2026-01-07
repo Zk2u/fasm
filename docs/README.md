@@ -1,10 +1,10 @@
-# PHASM Documentation
+# FASM Documentation
 
-Comprehensive guides for building correct, performant, and testable state machines with PHASM.
+Comprehensive guides for building correct, performant, and testable state machines with FASM.
 
 ## Getting Started
 
-1. [Core Concepts](01_core_concepts.md) - Understanding PHASM's architecture and design
+1. [Core Concepts](01_core_concepts.md) - Understanding FASM's architecture and design
 2. [Critical Invariants](02_invariants.md) - Rules for building sound state machines
 3. [Performance Guide](03_performance.md) - Optimizing your state machines
 4. [Testing Guide](04_testing.md) - Deterministic simulation testing
@@ -13,7 +13,7 @@ Comprehensive guides for building correct, performant, and testable state machin
 ## Quick Links
 
 ### Core Concepts
-- What is PHASM and why use it?
+- What is FASM and why use it?
 - State, Input, STF, Actions, and Restore
 - Example: Payment processing system
 
@@ -46,7 +46,7 @@ Comprehensive guides for building correct, performant, and testable state machin
 
 ## Philosophy
 
-PHASM is designed around these principles:
+FASM is designed around these principles:
 
 1. **Determinism First**: Same state + input = same output (always)
 2. **Explicit Over Implicit**: All state mutations are visible
@@ -60,7 +60,7 @@ PHASM is designed around these principles:
 ### State Machine Skeleton (v0.3)
 
 ```rust
-use phasm::{Input, StateMachine, actions::{Action, ActionsContainer, TrackedAction, TrackedActionTypes}};
+use fasm::{Input, StateMachine, actions::{Action, ActionsContainer, TrackedAction, TrackedActionTypes}};
 
 struct MyStateMachine {
     data: HashMap<Id, Data>,

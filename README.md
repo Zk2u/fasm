@@ -1,13 +1,13 @@
-# PHASM - Fallible Async State Machines
+# FASM - Fallible Async State Machines
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org)
 
 A Rust framework for building **deterministic, testable, and crash-recoverable** state machines with async operations and fallible state access.
 
-## Why PHASM?
+## Why FASM?
 
-Traditional state machines break down in production—race conditions, crashes mid-operation, and bugs that only appear under load. PHASM solves this by making correctness **verifiable**:
+Traditional state machines break down in production—race conditions, crashes mid-operation, and bugs that only appear under load. FASM solves this by making correctness **verifiable**:
 
 - 🎯 **Deterministic execution** — Same inputs always produce same outputs
 - 🔄 **Crash recovery** — Resume from any failure point automatically
@@ -18,7 +18,7 @@ Traditional state machines break down in production—race conditions, crashes m
 ## Quick Example
 
 ```rust
-use phasm::{Input, StateMachine, actions::{Action, ActionsContainer, TrackedAction, TrackedActionTypes}};
+use fasm::{Input, StateMachine, actions::{Action, ActionsContainer, TrackedAction, TrackedActionTypes}};
 
 struct PaymentSystem {
     balance: u64,
@@ -249,7 +249,7 @@ cargo run --example coffee_shop
 cargo test --package dentist_booking
 ```
 
-## When to Use PHASM
+## When to Use FASM
 
 ### ✅ Great For
 - Payment processing

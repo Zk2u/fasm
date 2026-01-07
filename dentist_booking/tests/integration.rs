@@ -1,5 +1,5 @@
 use dentist_booking::*;
-use phasm::{Input, StateMachine};
+use fasm::{Input, StateMachine};
 
 #[monoio::test]
 async fn test_basic_booking_flow() {
@@ -443,10 +443,7 @@ async fn test_booking_preferences_honored() {
     );
 
     // Test 3: Different appointment durations work correctly
-    for (user_id, apt_type) in [
-        (3, AptType::Cleaning),
-        (4, AptType::Checkup),
-    ] {
+    for (user_id, apt_type) in [(3, AptType::Cleaning), (4, AptType::Checkup)] {
         actions.clear();
 
         BookingSystem::stf(

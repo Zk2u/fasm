@@ -1,6 +1,6 @@
 # Critical Invariants for Correctness
 
-For a PHASM state machine to be theoretically sound and crash-safe, these invariants MUST hold.
+For a FASM state machine to be theoretically sound and crash-safe, these invariants MUST hold.
 
 ## Important: State Can Be External
 

@@ -1,6 +1,6 @@
-# Deterministic Simulation Testing with PHASM
+# Deterministic Simulation Testing with FASM
 
-This document explains how we use PHASM to build **provably correct systems** through deterministic simulation testing.
+This document explains how we use FASM to build **provably correct systems** through deterministic simulation testing.
 
 ## The Problem
 
@@ -11,7 +11,7 @@ Traditional testing approaches struggle with:
 - **Combinatorial explosion** of possible states
 - **Flaky tests** from non-deterministic behavior
 
-## The PHASM Solution
+## The FASM Solution
 
 By modeling systems as **fallible async state machines**, we can:
 
@@ -278,7 +278,7 @@ test result: ok. 8 passed; 0 failed
 
 ## When to Use This Approach
 
-✅ **Use PHASM simulation testing when:**
+✅ **Use FASM simulation testing when:**
 - Correctness is critical (payments, reservations, etc.)
 - Race conditions are possible
 - System has complex state interactions
@@ -334,6 +334,6 @@ Run with `cargo test` and your new test is automatically included!
 
 ## Conclusion
 
-PHASM + simulation testing enables building **provably correct distributed systems**. By making execution deterministic and checking invariants continuously, we catch bugs that would otherwise only appear in production under rare conditions.
+FASM + simulation testing enables building **provably correct distributed systems**. By making execution deterministic and checking invariants continuously, we catch bugs that would otherwise only appear in production under rare conditions.
 
 This is the **main use case** of building systems as state machines - not just cleaner code, but **actual correctness guarantees** through systematic testing.

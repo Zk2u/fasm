@@ -1,6 +1,6 @@
 # Testing Guide
 
-PHASM enables **deterministic simulation testing** - the killer feature for building correct systems.
+FASM enables **deterministic simulation testing** - the killer feature for building correct systems.
 
 ## Why Simulation Testing?
 

@@ -1,11 +1,11 @@
-//! # PHASM - Fallible Async State Machines
+//! # FASM - Fallible Async State Machines
 //!
 //! A framework for building deterministic, testable, and crash-recoverable state machines
 //! with async operations and fallible state access.
 //!
 //! ## Core Concept
 //!
-//! PHASM separates state machine logic from external side effects:
+//! FASM separates state machine logic from external side effects:
 //!
 //! - **State Transition Function (STF)**: A deterministic function that reads state and input,
 //!   validates transitions, mutates state, and emits action descriptions.
@@ -41,7 +41,7 @@
 //!
 //! ## Atomicity
 //!
-//! PHASM provides atomicity through two mechanisms:
+//! FASM provides atomicity through two mechanisms:
 //!
 //! ### Transactional State (Database-backed)
 //!
@@ -95,8 +95,8 @@
 //! 3. **No Side Effects**: STF only mutates state and emits action *descriptions*. Actual
 //!    side effects (HTTP calls, sending emails) happen after commit.
 //!
-//! 4. **Tracked Actions in State**: Before emitting a tracked action, store enough data
-//!    in state that `restore()` can recreate it after a crash.
+//! 4. **Tracked Actions in State**: Before emitting a tracked action, store enough
+//!    data in state that `restore()` can recreate it after a crash.
 //!
 //! 5. **Restore is Pure**: `restore()` only reads from the state parameter. It cannot
 //!    make external queries.
@@ -104,7 +104,7 @@
 //! ## Example
 //!
 //! ```ignore
-//! use phasm::{StateMachine, Input, actions::{Action, TrackedAction, TrackedActionTypes}};
+//! use fasm::{StateMachine, Input, actions::{Action, TrackedAction, TrackedActionTypes}};
 //!
 //! struct MySystem {
 //!     balance: u64,
@@ -158,7 +158,7 @@
 //!
 //! ## Testing
 //!
-//! PHASM enables deterministic simulation testing:
+//! FASM enables deterministic simulation testing:
 //!
 //! ```ignore
 //! let mut rng = ChaCha8Rng::seed_from_u64(12345);
@@ -226,7 +226,7 @@ pub enum Input<TA: TrackedActionTypes, T> {
 ///
 /// # Overview
 ///
-/// A PHASM state machine is conceptually a function:
+/// A FASM state machine is conceptually a function:
 ///
 /// ```text
 /// (State, Input) -> Result<(State', Actions), Error>

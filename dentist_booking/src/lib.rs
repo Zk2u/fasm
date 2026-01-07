@@ -1,6 +1,6 @@
 //! Dentist booking system state machine.
 //!
-//! Demonstrates a realistic PHASM application with:
+//! Demonstrates a realistic FASM application with:
 //! - Schedule management
 //! - Slot availability checking
 //! - Payment pre-authorization (tracked actions)
@@ -11,7 +11,7 @@ pub mod types;
 
 use ahash::{HashMap, HashMapExt};
 
-use phasm::{
+use fasm::{
     actions::{Action, ActionsContainer, TrackedAction, TrackedActionTypes},
     Input, StateMachine,
 };

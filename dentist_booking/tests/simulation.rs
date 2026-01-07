@@ -1,5 +1,5 @@
 use dentist_booking::*;
-use phasm::{Input, StateMachine};
+use fasm::{Input, StateMachine};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::time::{Duration, Instant};

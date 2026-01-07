@@ -1,5 +1,5 @@
 use dentist_booking::*;
-use phasm::{Input, StateMachine};
+use fasm::{Input, StateMachine};
 
 #[monoio::main]
 async fn main() {
@@ -24,7 +24,7 @@ async fn main() {
     )
     .await
     .unwrap();
-    
+
     let req_id = system.pending.keys().next().copied().unwrap();
     actions.clear();
 
@@ -38,14 +38,19 @@ async fn main() {
     )
     .await
     .unwrap();
-    
+
     println!("✓ Alice booked\n");
     actions.clear();
 
     // Show final bookings
     println!("Final bookings:");
     for (slot, booking) in &system.bookings {
-        println!("  {} - {} ({})", slot, booking.name, booking.apt_type.name());
+        println!(
+            "  {} - {} ({})",
+            slot,
+            booking.name,
+            booking.apt_type.name()
+        );
     }
 
     // Check invariants

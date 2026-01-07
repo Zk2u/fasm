@@ -1,6 +1,6 @@
 # Database-Backed State
 
-A powerful PHASM pattern: **State can be a transactional database** like FoundationDB, PostgreSQL, or SQLite.
+A powerful FASM pattern: **State can be a transactional database** like FoundationDB, PostgreSQL, or SQLite.
 
 ## The Key Insight
 
@@ -21,7 +21,7 @@ As long as the database is:
 2. **Accessed through `state`** (not external connection)
 3. **Deterministic** (same reads produce same writes)
 
-It works perfectly with PHASM!
+It works perfectly with FASM!
 
 ## Why This Works
 
@@ -121,8 +121,10 @@ impl<'txn> FdbState<'txn> {
     }
 }
 
+// Note: In practice, you'd use a generic lifetime parameter or a different
+// architecture. This is conceptual pseudo-code showing the pattern.
 impl StateMachine for BookingSystem {
-    type State = FdbState<'txn>; // Lifetime-bound to transaction
+    type State = FdbState<'static>; // Actual impl would use generic lifetime
     
     async fn stf(
         state: &mut FdbState<'_>,
@@ -568,7 +570,7 @@ Now the database *enforces* your invariants! If you violate them, the transactio
 
 ## Conclusion
 
-Database-backed state is a **first-class pattern** in PHASM. The transaction handle *is* your state, accessed through the `state` parameter. This provides:
+Database-backed state is a **first-class pattern** in FASM. The transaction handle *is* your state, accessed through the `state` parameter. This provides:
 
 - Stronger atomicity (ACID)
 - Built-in persistence
