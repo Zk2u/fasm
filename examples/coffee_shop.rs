@@ -417,16 +417,10 @@ impl<'state, 'actions> CoffeeStfFuture<'state, 'actions> {
             return Err(CoffeeShopError::InsufficientPoints);
         }
 
-        // Generate a deterministic redemption ID from state
+        // Generate a deterministic redemption ID from state (don't mutate yet)
         let redemption_id = RedemptionId(self.state.next_redemption_id);
-        self.state.next_redemption_id += 1;
 
-        // Store pending redemption in state (for crash recovery)
-        self.state.pending_redemption = Some(PendingRedemption {
-            id: redemption_id.clone(),
-            points,
-        });
-
+        // Perform all fallible operations BEFORE mutating state
         // Create tracked action to send to backend
         self.actions
             .add(Action::Tracked(TrackedAction::new(
@@ -448,6 +442,15 @@ impl<'state, 'actions> CoffeeStfFuture<'state, 'actions> {
                 event: format!("redemption_requested:{}", points),
             }))
             .map_err(|_| CoffeeShopError::FailedToQueueAction)?;
+
+        // All fallible operations succeeded - NOW mutate state
+        self.state.next_redemption_id += 1;
+
+        // Store pending redemption in state (for crash recovery)
+        self.state.pending_redemption = Some(PendingRedemption {
+            id: redemption_id.clone(),
+            points,
+        });
 
         Ok(())
     }

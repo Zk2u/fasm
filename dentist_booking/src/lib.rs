@@ -9,8 +9,8 @@ use std::{
 use ahash::{HashMap, HashMapExt};
 
 use phasm::{
-    Input, StateMachine,
     actions::{Action, ActionsContainer, TrackedAction, TrackedActionTypes},
+    Input, StateMachine,
 };
 
 pub use types::*;
@@ -450,8 +450,21 @@ impl<'s, 'a> BookingFuture<'s, 'a> {
         }
 
         let id = self.state.next_id;
-        self.state.next_id += 1;
 
+        // Perform fallible operation BEFORE mutating state
+        self.actions
+            .add(Action::Tracked(TrackedAction::new(
+                id,
+                PaymentReq::Preauth {
+                    user_id,
+                    amount_cents: (apt_type.price() * 100.0) as u32,
+                    req_id: id,
+                },
+            )))
+            .map_err(|_| BookingError::ActionQueueFailed)?;
+
+        // Now safe to mutate state - no more fallible operations
+        self.state.next_id += 1;
         self.state.pending.insert(
             id,
             PendingReq {
@@ -463,17 +476,6 @@ impl<'s, 'a> BookingFuture<'s, 'a> {
                 status: ReqStatus::AwaitingPreauth,
             },
         );
-
-        self.actions
-            .add(Action::Tracked(TrackedAction::new(
-                id,
-                PaymentReq::Preauth {
-                    user_id,
-                    amount_cents: (apt_type.price() * 100.0) as u32,
-                    req_id: id,
-                },
-            )))
-            .map_err(|_| BookingError::ActionQueueFailed)?;
 
         Ok(())
     }
@@ -493,8 +495,21 @@ impl<'s, 'a> BookingFuture<'s, 'a> {
             .ok_or(BookingError::NoSlotFound)?;
 
         let id = self.state.next_id;
-        self.state.next_id += 1;
 
+        // Perform fallible operation BEFORE mutating state
+        self.actions
+            .add(Action::Tracked(TrackedAction::new(
+                id,
+                PaymentReq::Preauth {
+                    user_id,
+                    amount_cents: (apt_type.price() * 100.0) as u32,
+                    req_id: id,
+                },
+            )))
+            .map_err(|_| BookingError::ActionQueueFailed)?;
+
+        // Now safe to mutate state - no more fallible operations
+        self.state.next_id += 1;
         self.state.pending.insert(
             id,
             PendingReq {
@@ -506,17 +521,6 @@ impl<'s, 'a> BookingFuture<'s, 'a> {
                 status: ReqStatus::AwaitingPreauth,
             },
         );
-
-        self.actions
-            .add(Action::Tracked(TrackedAction::new(
-                id,
-                PaymentReq::Preauth {
-                    user_id,
-                    amount_cents: (apt_type.price() * 100.0) as u32,
-                    req_id: id,
-                },
-            )))
-            .map_err(|_| BookingError::ActionQueueFailed)?;
 
         Ok(())
     }
