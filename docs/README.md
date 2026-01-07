@@ -29,7 +29,6 @@ Comprehensive guides for building correct, performant, and testable state machin
 - Invariant checking strategies
 - Memory efficiency
 - In-memory optimization patterns
-- Real-world benchmarks (1.4M ops/sec)
 
 ### Database-Backed State
 - State as transactional database (FoundationDB, PostgreSQL)
@@ -51,46 +50,93 @@ PHASM is designed around these principles:
 
 1. **Determinism First**: Same state + input = same output (always)
 2. **Explicit Over Implicit**: All state mutations are visible
-3. **Separation of Concerns**: State mutations (including database writes via `state`) vs. external side effects (actions for HTTP calls, notifications, etc.)
+3. **Separation of Concerns**: State mutations vs. external side effects
 4. **Crash Recovery**: System can always resume from persisted state
 5. **Testability**: Simulation testing finds bugs humans miss
 6. **Flexibility**: State can be in-memory, database transaction, or hybrid
 
 ## Common Patterns
 
-### State Machine Skeleton
+### State Machine Skeleton (v0.3)
 
 ```rust
+use phasm::{Input, StateMachine, actions::{Action, ActionsContainer, TrackedAction, TrackedActionTypes}};
+
 struct MyStateMachine {
-    // Your state
     data: HashMap<Id, Data>,
     pending: HashMap<RequestId, PendingRequest>,
     next_id: u64,
 }
 
+struct MyTracked;
+impl TrackedActionTypes for MyTracked {
+    type Id = u64;
+    type Action = MyRequest;
+    type Result = MyResult;
+}
+
 impl StateMachine for MyStateMachine {
-    type TrackedAction = MyTracked;
-    type UntrackedAction = MyUntracked;
-    type Actions = Vec<Action<...>>;
     type State = Self;
     type Input = MyInput;
+    type TrackedAction = MyTracked;
+    type UntrackedAction = MyUntracked;
+    type Actions = Vec<Action<Self::UntrackedAction, Self::TrackedAction>>;
     type TransitionError = MyError;
     type RestoreError = ();
-    
-    type StfFuture<...> = MyStfFuture<...>;
-    type RestoreFuture<...> = future::Ready<Result<(), ()>>;
-    
-    fn stf(...) -> Self::StfFuture<...> {
-        MyStfFuture { state, actions, input }
-    }
-    
-    fn restore(...) -> Self::RestoreFuture<...> {
-        actions.clear()?;
-        for (id, pending) in &state.pending {
-            // Recreate tracked actions from state
+
+    async fn stf<'s, 'a>(
+        state: &'s mut Self::State,
+        input: Input<Self::TrackedAction, Self::Input>,
+        actions: &'a mut Self::Actions,
+    ) -> Result<(), Self::TransitionError> {
+        match input {
+            Input::Normal(request) => {
+                // 1. Validate
+                // 2. Fallible operations (actions.add)
+                // 3. Mutate state
+                Ok(())
+            }
+            Input::TrackedActionCompleted { id, result } => {
+                // Handle tracked action completion
+                Ok(())
+            }
         }
-        future::ready(Ok(()))
     }
+
+    async fn restore<'s, 'a>(
+        state: &'s Self::State,
+        actions: &'a mut Self::Actions,
+    ) -> Result<(), Self::RestoreError> {
+        for (&id, pending) in &state.pending {
+            actions.add(Action::Tracked(TrackedAction::new(id, ...)))?;
+        }
+        Ok(())
+    }
+}
+```
+
+### Atomicity Pattern
+
+For in-memory state, perform fallible operations before mutations:
+
+```rust
+async fn stf(state: &mut State, input: Input, actions: &mut Actions) -> Result<(), Error> {
+    // 1. Validation (can return Err)
+    if !state.is_valid(&input) {
+        return Err(Error::Invalid);
+    }
+
+    // 2. Prepare values (no mutation yet)
+    let id = state.next_id;
+
+    // 3. Fallible operations first
+    actions.add(Action::Tracked(...))?;
+
+    // 4. Now mutate state (point of no return)
+    state.next_id += 1;
+    state.pending.insert(id, ...);
+
+    Ok(())
 }
 ```
 
@@ -114,17 +160,30 @@ impl MyState {
 async fn test_simulation() {
     let mut rng = ChaCha8Rng::seed_from_u64(12345);
     let mut state = MyStateMachine::new();
-    
+    let mut actions = Vec::new();
+
     for i in 0..100_000 {
         let input = generate_random_input(&mut rng);
-        state.stf(input, &mut actions).await.ok();
+        let _ = MyStateMachine::stf(&mut state, input, &mut actions).await;
+        actions.clear();
         state.check_invariants()
-            .expect(&format!("Invariant violated at {}", i));
+            .expect(&format!("Invariant violated at iteration {}", i));
     }
 }
 ```
 
+## Version 0.3 Changes
+
+- **Simplified trait**: Uses `async fn` with `impl Future + use<'state, 'actions, Self>` syntax (Rust 2024)
+- **Renamed field**: `Input::TrackedActionCompleted { id, result }` (was `res`)
+- **No more GATs**: No need for `type StfFuture<'state, 'actions>` or `type RestoreFuture<...>`
+- **Cleaner implementations**: Just write `async fn` in your impl block
+
 ## Examples
+
+See the examples directory:
+- `csm.rs` - Simple counter state machine
+- `coffee_shop.rs` - Loyalty app with tracked/untracked actions and restore
 
 See `dentist_booking/` crate for a full example:
 - Weekly schedules with multiple time ranges
@@ -132,15 +191,6 @@ See `dentist_booking/` crate for a full example:
 - Auto-selection algorithm
 - Payment preauthorization
 - Comprehensive simulation test suite
-- 4.27M operations tested with full invariant checking
-
-## Contributing
-
-When adding new documentation:
-- Use concrete code examples
-- Explain the "why" not just the "what"
-- Include both correct and incorrect patterns
-- Link to relevant examples
 
 ## See Also
 

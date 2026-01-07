@@ -2,7 +2,7 @@
 
 ## What is PHASM?
 
-PHASM (Phallible ASync State Machines) is a framework for building **deterministic, testable, and crash-recoverable** state machines with async operations and fallible state access.
+PHASM (Fallible Async State Machines) is a framework for building **deterministic, testable, and crash-recoverable** state machines with async operations and fallible state access.
 
 ## The Problem PHASM Solves
 
@@ -34,142 +34,220 @@ Input → STF → (Updated State, Actions)
 ### Components
 
 #### 1. State
-Your application state - can be:
+
+Your application state—can be:
 - In-memory struct (HashMap, Vec, custom types)
 - Database transaction (accessed via `state` parameter)
 - Any storage accessed through the `state` parameter
 
-**Rule**: Must be recoverable after crash (persisted or reconstructible from database).
+**Rule**: Must be recoverable after crash (persisted or reconstructible).
 
-**Important**: Mutations to state (including database writes through `state`) are NOT side effects - they're the core state transition. Only operations outside of `state` are side effects.
+**Important**: Mutations to state (including database writes through `state`) are NOT side effects—they're the core state transition. Only operations outside of `state` are side effects.
 
 #### 2. Input
+
 Two types:
 - **Normal Input**: User requests, external events, timers
 - **Tracked Action Results**: Results from previously emitted tracked actions
 
-**Rule**: ALL external data must come through Input. This means:
-- ✅ Reading/writing database through `state` parameter: **Allowed** (it's state mutation)
-- ❌ Opening new database connections in STF: **Forbidden** (non-deterministic)
-- ❌ Making HTTP calls to external services: **Forbidden** (use actions instead)
+**Rule**: ALL external data must come through Input:
+- ✅ Reading/writing database through `state` parameter: **Allowed**
+- ❌ Opening new database connections in STF: **Forbidden**
+- ❌ Making HTTP calls to external services: **Forbidden**
 - ❌ Reading system time directly: **Forbidden** (pass as input)
-- ❌ Reading from external APIs: **Forbidden** (pass results as input)
+- ❌ Using randomness: **Forbidden** (use seeded RNG in state)
 
 #### 3. STF (State Transition Function)
+
 Pure function: `(State, Input) → (State', Actions)`
 
 **Properties**:
 - Deterministic: Same state + input = same output
 - Atomic: Either succeeds completely or leaves state unchanged
-- No external side effects: Only mutates state (including database writes via `state`) and emits action descriptions
+- No external side effects: Only mutates state and emits action descriptions
 
 #### 4. Actions
-Descriptions of side effects to execute:
+
+Descriptions of side effects to execute after commit:
 
 **Tracked Actions**: 
 - Require confirmation/results
 - Stored in state for crash recovery
-- Examples: External API calls, payment processing, calling other services
+- Examples: External API calls, payment processing
 
 **Untracked Actions**:
 - Fire-and-forget
 - Not recovered after crashes
-- Examples: Notifications, logs, metrics, analytics
+- Examples: Notifications, logs, metrics
 
-**Note**: Database writes through the `state` parameter are NOT actions - they're state mutations. Actions are for external operations outside of your state.
+#### 5. Restore
 
-## The Key Insight
-
-By separating **state mutations** (including database writes via `state`) from **external side effects** (actions), we get:
-
-1. **Determinism**: STF is deterministic, testable function
-2. **Crash Recovery**: Tracked actions stored in state
-3. **Flexibility**: Execute actions however you want
-4. **Testability**: Can simulate millions of transitions
-5. **Clear Boundaries**: State mutations (including DB) vs. external calls are explicit
+Rebuilds pending tracked actions from state after crash:
+- Pure function of state (no external queries)
+- Runtime clears actions container before calling
+- Enables automatic crash recovery
 
 ## Example: Payment Processing
 
 ```rust
+use phasm::{Input, StateMachine, actions::{Action, ActionsContainer, TrackedAction, TrackedActionTypes}};
+use std::collections::HashMap;
+
+// State
 struct PaymentSystem {
     pending_payments: HashMap<u64, Payment>,
     confirmed_payments: Vec<u64>,
     next_id: u64,
 }
 
+struct Payment {
+    amount: f32,
+    user: String,
+    status: PaymentStatus,
+    transaction_id: Option<String>,
+    failure_reason: Option<String>,
+}
+
+#[derive(PartialEq)]
+enum PaymentStatus { Pending, Confirmed, Failed }
+
+// Input
 enum PaymentInput {
     ProcessPayment { amount: f32, user: String },
 }
 
-enum PaymentAction {
-    ChargeCard { payment_id: u64, amount: f32 },
+// Tracked action types
+struct PaymentTracked;
+impl TrackedActionTypes for PaymentTracked {
+    type Id = u64;
+    type Action = PaymentAction;
+    type Result = PaymentResult;
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PaymentAction {
+    ChargeCard { payment_id: u64, amount_cents: u32 },
+    CheckStatus { payment_id: u64 },
+}
+
+#[derive(Debug)]
 enum PaymentResult {
     Success { transaction_id: String },
     Failed { reason: String },
 }
 
+// Untracked actions
+#[derive(Debug)]
+enum Notification {
+    NotifyUser { user: String, message: String },
+}
+
+// Errors
+#[derive(Debug)]
+enum PaymentError {
+    NotFound,
+    ActionFailed,
+}
+
 impl StateMachine for PaymentSystem {
-    async fn stf(state: &mut State, input: Input, actions: &mut Actions) {
+    type State = Self;
+    type Input = PaymentInput;
+    type TrackedAction = PaymentTracked;
+    type UntrackedAction = Notification;
+    type Actions = Vec<Action<Self::UntrackedAction, Self::TrackedAction>>;
+    type Error = PaymentError;
+
+    async fn stf<'s, 'a>(
+        state: &'s mut Self::State,
+        input: Input<Self::TrackedAction, Self::Input>,
+        actions: &'a mut Self::Actions,
+    ) -> Result<(), Self::Error> {
         match input {
-            Input::Normal(ProcessPayment { amount, user }) => {
-                // Generate deterministic ID from state
+            Input::Normal(PaymentInput::ProcessPayment { amount, user }) => {
+                // 1. Prepare values (no mutation yet)
                 let payment_id = state.next_id;
+
+                // 2. Fallible operations first
+                actions
+                    .add(Action::Tracked(TrackedAction::new(
+                        payment_id,
+                        PaymentAction::ChargeCard {
+                            payment_id,
+                            amount_cents: (amount * 100.0) as u32,
+                        },
+                    )))
+                    .map_err(|_| PaymentError::ActionFailed)?;
+
+                actions
+                    .add(Action::Untracked(Notification::NotifyUser {
+                        user: user.clone(),
+                        message: "Processing payment...".into(),
+                    }))
+                    .map_err(|_| PaymentError::ActionFailed)?;
+
+                // 3. Now mutate state
                 state.next_id += 1;
-                
-                // Store in state BEFORE emitting action
-                state.pending_payments.insert(payment_id, Payment {
-                    amount,
-                    user: user.clone(),
-                    status: Pending,
-                });
-                
-                // Emit tracked action to charge card
-                actions.add(Action::Tracked(
-                    TrackedAction::new(payment_id, ChargeCard { payment_id, amount })
-                ))?;
-                
-                // Emit untracked notification
-                actions.add(Action::Untracked(
-                    NotifyUser { user, message: "Processing payment..." }
-                ))?;
+                state.pending_payments.insert(
+                    payment_id,
+                    Payment {
+                        amount,
+                        user,
+                        status: PaymentStatus::Pending,
+                        transaction_id: None,
+                        failure_reason: None,
+                    },
+                );
+
+                Ok(())
             }
-            
-            Input::TrackedActionCompleted { id: payment_id, res } => {
-                let payment = state.pending_payments.get_mut(&payment_id)?;
-                
-                match res {
-                    Success { transaction_id } => {
-                        payment.status = Confirmed;
+
+            Input::TrackedActionCompleted { id: payment_id, result } => {
+                let payment = state
+                    .pending_payments
+                    .get_mut(&payment_id)
+                    .ok_or(PaymentError::NotFound)?;
+
+                match result {
+                    PaymentResult::Success { transaction_id } => {
+                        payment.status = PaymentStatus::Confirmed;
                         payment.transaction_id = Some(transaction_id);
                         state.confirmed_payments.push(payment_id);
-                        
-                        actions.add(Action::Untracked(
-                            NotifyUser { user: payment.user, message: "Payment confirmed!" }
-                        ))?;
+
+                        actions
+                            .add(Action::Untracked(Notification::NotifyUser {
+                                user: payment.user.clone(),
+                                message: "Payment confirmed!".into(),
+                            }))
+                            .map_err(|_| PaymentError::ActionFailed)?;
                     }
-                    Failed { reason } => {
-                        payment.status = Failed;
+                    PaymentResult::Failed { reason } => {
+                        payment.status = PaymentStatus::Failed;
                         payment.failure_reason = Some(reason);
                     }
                 }
+
+                Ok(())
             }
         }
     }
-    
-    async fn restore(state: &State, actions: &mut Actions) {
-        actions.clear()?;
-        
-        // Restore all pending payments
-        for (payment_id, payment) in &state.pending_payments {
-            if payment.status == Pending {
-                // Re-check status with payment processor
-                actions.add(Action::Tracked(
-                    TrackedAction::new(*payment_id, CheckPaymentStatus { payment_id })
-                ))?;
+
+    async fn restore<'s, 'a>(
+        state: &'s Self::State,
+        actions: &'a mut Self::Actions,
+    ) -> Result<(), Self::Error> {
+        // Runtime clears actions before calling restore
+        for (&payment_id, payment) in &state.pending_payments {
+            if payment.status == PaymentStatus::Pending {
+                actions
+                    .add(Action::Tracked(TrackedAction::new(
+                        payment_id,
+                        PaymentAction::CheckStatus { payment_id },
+                    )))
+                    .map_err(|_| PaymentError::ActionFailed)?;
             }
         }
+
+        Ok(())
     }
 }
 ```
@@ -179,17 +257,16 @@ impl StateMachine for PaymentSystem {
 1. System crashes with pending payment
 2. On restart, load state from disk:
    ```rust
-   {
+   PaymentSystem {
        pending_payments: { 123: Payment { status: Pending, ... } },
        next_id: 124,
    }
    ```
-3. Call `restore()`:
-   - Sees payment 123 is pending
-   - Emits `CheckPaymentStatus(123)` tracked action
-4. Execute action, get result
-5. Feed result back through `stf()` as `TrackedActionCompleted`
-6. Payment marked confirmed or failed
+3. Runtime clears actions, calls `restore()`
+4. Restore sees payment 123 is pending, emits `CheckStatus(123)`
+5. Execute action, get result from external system
+6. Feed result back through `stf()` as `TrackedActionCompleted`
+7. Payment marked confirmed or failed
 
 ## Why This Works
 
@@ -199,8 +276,18 @@ impl StateMachine for PaymentSystem {
 
 **Testability**: Can simulate crash at any point and verify recovery works correctly.
 
+## The Key Insight
+
+By separating **state mutations** from **external side effects** (actions):
+
+1. **Determinism**: STF is a testable pure function
+2. **Crash Recovery**: Tracked actions stored in state
+3. **Flexibility**: Execute actions however you want
+4. **Testability**: Simulate millions of transitions
+5. **Clear Boundaries**: State vs. external calls are explicit
+
 ## Next Steps
 
-- [Critical Invariants](02_invariants.md) - Rules for correctness
-- [Performance Guide](03_performance.md) - Optimizing state machines
-- [Testing Guide](04_testing.md) - Simulation and property testing
+- [Critical Invariants](02_invariants.md) — Rules for correctness
+- [Testing Guide](04_testing.md) — Simulation and property testing
+- [Database State](05_database_state.md) — Using databases as state

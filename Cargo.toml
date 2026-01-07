@@ -1,6 +1,6 @@
 [package]
 name = "phasm"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["Azz <zk2u@pm.me>"]
 description = "Phallible Async State Machines"

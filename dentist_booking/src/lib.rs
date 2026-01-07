@@ -1,10 +1,13 @@
-pub mod types;
+//! Dentist booking system state machine.
+//!
+//! Demonstrates a realistic PHASM application with:
+//! - Schedule management
+//! - Slot availability checking
+//! - Payment pre-authorization (tracked actions)
+//! - Race condition handling
+//! - Invariant checking for testing
 
-use std::{
-    future,
-    pin::Pin,
-    task::{Context, Poll},
-};
+pub mod types;
 
 use ahash::{HashMap, HashMapExt};
 
@@ -89,10 +92,7 @@ impl BookingSystem {
     }
 
     pub fn add_schedule(&mut self, day: Day, range: TimeRange) {
-        self.schedule
-            .entry(day)
-            .or_insert_with(Vec::new)
-            .push(range);
+        self.schedule.entry(day).or_default().push(range);
     }
 
     pub fn is_available(&self, slot: Slot, dur: u16) -> bool {
@@ -213,6 +213,10 @@ impl Default for BookingSystem {
     }
 }
 
+// ============================================================================
+// Input and Error Types
+// ============================================================================
+
 #[derive(Debug)]
 pub enum BookingInput {
     RequestSlot {
@@ -241,7 +245,10 @@ pub enum BookingError {
     ActionQueueFailed,
 }
 
-// Tracked actions
+// ============================================================================
+// Tracked Actions
+// ============================================================================
+
 pub type ReqId = u64;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -276,97 +283,35 @@ impl TrackedActionTypes for BookingTracked {
     type Result = PaymentResult;
 }
 
-// Untracked actions
+// ============================================================================
+// Untracked Actions
+// ============================================================================
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum UntrackedAction {
     Notify { user_id: u64, msg: String },
     Log { event: String },
 }
 
-impl StateMachine for BookingSystem {
-    type UntrackedAction = UntrackedAction;
-    type TrackedAction = BookingTracked;
-    type Actions = Vec<Action<Self::UntrackedAction, Self::TrackedAction>>;
+// ============================================================================
+// StateMachine Implementation
+// ============================================================================
 
+impl StateMachine for BookingSystem {
     type State = Self;
     type Input = BookingInput;
-
+    type TrackedAction = BookingTracked;
+    type UntrackedAction = UntrackedAction;
+    type Actions = Vec<Action<Self::UntrackedAction, Self::TrackedAction>>;
     type TransitionError = BookingError;
-    type RestoreError = ();
+    type RestoreError = BookingError;
 
-    type StfFuture<'state, 'actions> = BookingFuture<'state, 'actions>;
-    type RestoreFuture<'state, 'actions> = future::Ready<Result<(), Self::RestoreError>>;
-
-    fn stf<'state, 'actions>(
-        state: &'state mut Self::State,
+    async fn stf(
+        state: &mut Self::State,
         input: Input<Self::TrackedAction, Self::Input>,
-        actions: &'actions mut Self::Actions,
-    ) -> Self::StfFuture<'state, 'actions> {
-        BookingFuture {
-            state,
-            actions,
-            input,
-        }
-    }
-
-    fn restore<'state, 'actions>(
-        state: &'state Self::State,
-        actions: &'actions mut Self::Actions,
-    ) -> Self::RestoreFuture<'state, 'actions> {
-        let _ = actions.clear();
-        for (id, pending) in &state.pending {
-            if pending.status == ReqStatus::AwaitingPreauth {
-                let _ = actions.add(Action::Tracked(TrackedAction::new(
-                    *id,
-                    PaymentReq::CheckStatus { req_id: *id },
-                )));
-            }
-        }
-        future::ready(Ok(()))
-    }
-}
-
-pub struct BookingFuture<'s, 'a> {
-    state: &'s mut BookingSystem,
-    actions: &'a mut <BookingSystem as StateMachine>::Actions,
-    input: Input<
-        <BookingSystem as StateMachine>::TrackedAction,
-        <BookingSystem as StateMachine>::Input,
-    >,
-}
-
-impl<'s, 'a> future::Future for BookingFuture<'s, 'a> {
-    type Output = Result<(), BookingError>;
-
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        enum Action {
-            Slot {
-                user_id: u64,
-                name: String,
-                email: String,
-                slot: Slot,
-                apt_type: AptType,
-            },
-            Auto {
-                user_id: u64,
-                name: String,
-                email: String,
-                days: Vec<Day>,
-                times: Vec<TimeRange>,
-                apt_type: AptType,
-            },
-            Success {
-                req_id: ReqId,
-                amount: f32,
-            },
-            Failed {
-                req_id: ReqId,
-                reason: String,
-            },
-            Other,
-        }
-
-        let action = match &self.input {
+        actions: &mut Self::Actions,
+    ) -> Result<(), Self::TransitionError> {
+        match input {
             Input::Normal(BookingInput::RequestSlot {
                 user_id,
                 name,
@@ -374,16 +319,10 @@ impl<'s, 'a> future::Future for BookingFuture<'s, 'a> {
                 day,
                 time,
                 apt_type,
-            }) => Action::Slot {
-                user_id: *user_id,
-                name: name.clone(),
-                email: email.clone(),
-                slot: Slot {
-                    day: *day,
-                    time: *time,
-                },
-                apt_type: *apt_type,
-            },
+            }) => {
+                let slot = Slot { day, time };
+                handle_slot_request(state, actions, user_id, name, email, slot, apt_type)
+            }
             Input::Normal(BookingInput::RequestAuto {
                 user_id,
                 name,
@@ -391,195 +330,190 @@ impl<'s, 'a> future::Future for BookingFuture<'s, 'a> {
                 days,
                 times,
                 apt_type,
-            }) => Action::Auto {
-                user_id: *user_id,
-                name: name.clone(),
-                email: email.clone(),
-                days: days.clone(),
-                times: times.clone(),
-                apt_type: *apt_type,
+            }) => handle_auto_request(state, actions, user_id, name, email, days, times, apt_type),
+            Input::TrackedActionCompleted { id, result } => match result {
+                PaymentResult::Success { amount } => {
+                    handle_payment_success(state, actions, id, amount)
+                }
+                PaymentResult::Failed { reason } => handle_payment_failed(state, id, reason),
+                PaymentResult::Released | PaymentResult::Pending => Ok(()),
             },
-            Input::TrackedActionCompleted { id, res } => match res {
-                PaymentResult::Success { amount } => Action::Success {
-                    req_id: *id,
-                    amount: *amount,
-                },
-                PaymentResult::Failed { reason } => Action::Failed {
-                    req_id: *id,
-                    reason: reason.clone(),
-                },
-                _ => Action::Other,
-            },
-        };
+        }
+    }
 
-        let result = match action {
-            Action::Slot {
-                user_id,
-                name,
-                email,
-                slot,
-                apt_type,
-            } => self.handle_slot(user_id, name, email, slot, apt_type),
-            Action::Auto {
-                user_id,
-                name,
-                email,
-                days,
-                times,
-                apt_type,
-            } => self.handle_auto(user_id, name, email, days, times, apt_type),
-            Action::Success { req_id, amount } => self.handle_success(req_id, amount),
-            Action::Failed { req_id, reason } => self.handle_failed(req_id, reason),
-            Action::Other => Ok(()),
-        };
-        Poll::Ready(result)
+    async fn restore(
+        state: &Self::State,
+        actions: &mut Self::Actions,
+    ) -> Result<(), Self::RestoreError> {
+        for (&id, pending) in &state.pending {
+            if pending.status == ReqStatus::AwaitingPreauth {
+                actions
+                    .add(Action::Tracked(TrackedAction::new(
+                        id,
+                        PaymentReq::CheckStatus { req_id: id },
+                    )))
+                    .map_err(|_| BookingError::ActionQueueFailed)?;
+            }
+        }
+
+        Ok(())
     }
 }
 
-impl<'s, 'a> BookingFuture<'s, 'a> {
-    fn handle_slot(
-        &mut self,
-        user_id: u64,
-        name: String,
-        email: String,
-        slot: Slot,
-        apt_type: AptType,
-    ) -> Result<(), BookingError> {
-        if !self.state.is_available(slot, apt_type.dur()) {
-            return Err(BookingError::SlotNotAvailable);
-        }
+// ============================================================================
+// Handler Functions
+// ============================================================================
 
-        let id = self.state.next_id;
+fn handle_slot_request(
+    state: &mut BookingSystem,
+    actions: &mut Vec<Action<UntrackedAction, BookingTracked>>,
+    user_id: u64,
+    name: String,
+    email: String,
+    slot: Slot,
+    apt_type: AptType,
+) -> Result<(), BookingError> {
+    // Validation
+    if !state.is_available(slot, apt_type.dur()) {
+        return Err(BookingError::SlotNotAvailable);
+    }
 
-        // Perform fallible operation BEFORE mutating state
-        self.actions
-            .add(Action::Tracked(TrackedAction::new(
-                id,
-                PaymentReq::Preauth {
-                    user_id,
-                    amount_cents: (apt_type.price() * 100.0) as u32,
-                    req_id: id,
-                },
-            )))
-            .map_err(|_| BookingError::ActionQueueFailed)?;
+    // Prepare values (no mutation yet)
+    let id = state.next_id;
 
-        // Now safe to mutate state - no more fallible operations
-        self.state.next_id += 1;
-        self.state.pending.insert(
+    // Fallible operation first
+    actions
+        .add(Action::Tracked(TrackedAction::new(
             id,
-            PendingReq {
+            PaymentReq::Preauth {
                 user_id,
-                name,
-                email,
-                slot: Some(slot),
-                apt_type,
-                status: ReqStatus::AwaitingPreauth,
+                amount_cents: (apt_type.price() * 100.0) as u32,
+                req_id: id,
             },
-        );
+        )))
+        .map_err(|_| BookingError::ActionQueueFailed)?;
 
-        Ok(())
-    }
+    // Now mutate state
+    state.next_id += 1;
+    state.pending.insert(
+        id,
+        PendingReq {
+            user_id,
+            name,
+            email,
+            slot: Some(slot),
+            apt_type,
+            status: ReqStatus::AwaitingPreauth,
+        },
+    );
 
-    fn handle_auto(
-        &mut self,
-        user_id: u64,
-        name: String,
-        email: String,
-        days: Vec<Day>,
-        times: Vec<TimeRange>,
-        apt_type: AptType,
-    ) -> Result<(), BookingError> {
-        let slot = self
-            .state
-            .find_slot(&days, &times, apt_type.dur())
-            .ok_or(BookingError::NoSlotFound)?;
+    Ok(())
+}
 
-        let id = self.state.next_id;
+#[allow(clippy::too_many_arguments)]
+fn handle_auto_request(
+    state: &mut BookingSystem,
+    actions: &mut Vec<Action<UntrackedAction, BookingTracked>>,
+    user_id: u64,
+    name: String,
+    email: String,
+    days: Vec<Day>,
+    times: Vec<TimeRange>,
+    apt_type: AptType,
+) -> Result<(), BookingError> {
+    // Find available slot
+    let slot = state
+        .find_slot(&days, &times, apt_type.dur())
+        .ok_or(BookingError::NoSlotFound)?;
 
-        // Perform fallible operation BEFORE mutating state
-        self.actions
-            .add(Action::Tracked(TrackedAction::new(
-                id,
-                PaymentReq::Preauth {
-                    user_id,
-                    amount_cents: (apt_type.price() * 100.0) as u32,
-                    req_id: id,
-                },
-            )))
-            .map_err(|_| BookingError::ActionQueueFailed)?;
+    // Prepare values (no mutation yet)
+    let id = state.next_id;
 
-        // Now safe to mutate state - no more fallible operations
-        self.state.next_id += 1;
-        self.state.pending.insert(
+    // Fallible operation first
+    actions
+        .add(Action::Tracked(TrackedAction::new(
             id,
-            PendingReq {
+            PaymentReq::Preauth {
                 user_id,
-                name,
-                email,
-                slot: Some(slot),
-                apt_type,
-                status: ReqStatus::AwaitingPreauth,
+                amount_cents: (apt_type.price() * 100.0) as u32,
+                req_id: id,
             },
-        );
+        )))
+        .map_err(|_| BookingError::ActionQueueFailed)?;
 
-        Ok(())
+    // Now mutate state
+    state.next_id += 1;
+    state.pending.insert(
+        id,
+        PendingReq {
+            user_id,
+            name,
+            email,
+            slot: Some(slot),
+            apt_type,
+            status: ReqStatus::AwaitingPreauth,
+        },
+    );
+
+    Ok(())
+}
+
+fn handle_payment_success(
+    state: &mut BookingSystem,
+    actions: &mut Vec<Action<UntrackedAction, BookingTracked>>,
+    req_id: ReqId,
+    amount: f32,
+) -> Result<(), BookingError> {
+    let pending = state
+        .pending
+        .get(&req_id)
+        .ok_or(BookingError::InvalidRequest)?;
+
+    let slot = pending.slot.ok_or(BookingError::InvalidRequest)?;
+    let apt_type = pending.apt_type;
+    let user_id = pending.user_id;
+    let name = pending.name.clone();
+    let email = pending.email.clone();
+
+    // Race condition check - slot may have been taken
+    if !state.is_available(slot, apt_type.dur()) {
+        let pending = state.pending.get_mut(&req_id).unwrap();
+        pending.status = ReqStatus::SlotTaken;
+
+        // Release the pre-auth
+        let _ = actions.add(Action::Tracked(TrackedAction::new(
+            req_id,
+            PaymentReq::Release { req_id },
+        )));
+
+        return Ok(());
     }
 
-    fn handle_success(&mut self, req_id: ReqId, amount: f32) -> Result<(), BookingError> {
-        let (slot, apt_type, user_id, name, email) = {
-            let pending = self
-                .state
-                .pending
-                .get(&req_id)
-                .ok_or(BookingError::InvalidRequest)?;
+    // Confirm booking
+    let pending = state.pending.get_mut(&req_id).unwrap();
+    pending.status = ReqStatus::SlotConfirmed;
 
-            let Some(slot) = pending.slot else {
-                return Err(BookingError::InvalidRequest);
-            };
+    state.bookings.insert(
+        slot,
+        ConfirmedBooking {
+            user_id,
+            name,
+            email,
+            apt_type,
+            amount_paid: amount,
+        },
+    );
 
-            (
-                slot,
-                pending.apt_type,
-                pending.user_id,
-                pending.name.clone(),
-                pending.email.clone(),
-            )
-        };
+    Ok(())
+}
 
-        // Race condition check
-        if !self.state.is_available(slot, apt_type.dur()) {
-            let pending = self.state.pending.get_mut(&req_id).unwrap();
-            pending.status = ReqStatus::SlotTaken;
-            self.actions
-                .add(Action::Tracked(TrackedAction::new(
-                    req_id,
-                    PaymentReq::Release { req_id },
-                )))
-                .ok();
-            return Ok(());
-        }
-
-        // Confirm booking
-        let pending = self.state.pending.get_mut(&req_id).unwrap();
-        pending.status = ReqStatus::SlotConfirmed;
-        self.state.bookings.insert(
-            slot,
-            ConfirmedBooking {
-                user_id,
-                name,
-                email,
-                apt_type,
-                amount_paid: amount,
-            },
-        );
-
-        Ok(())
+fn handle_payment_failed(
+    state: &mut BookingSystem,
+    req_id: ReqId,
+    _reason: String,
+) -> Result<(), BookingError> {
+    if let Some(pending) = state.pending.get_mut(&req_id) {
+        pending.status = ReqStatus::NoSlot;
     }
-
-    fn handle_failed(&mut self, req_id: ReqId, _reason: String) -> Result<(), BookingError> {
-        if let Some(pending) = self.state.pending.get_mut(&req_id) {
-            pending.status = ReqStatus::NoSlot;
-        }
-        Ok(())
-    }
+    Ok(())
 }

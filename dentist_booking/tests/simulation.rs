@@ -404,7 +404,7 @@ async fn complete_preauth(
         system,
         Input::TrackedActionCompleted {
             id: req_id,
-            res: result,
+            result: result,
         },
         &mut actions,
     )
@@ -503,9 +503,10 @@ fn verify_booking_matches_request(
     // If confirmed, verify the booking also matches
     if pending.status == ReqStatus::SlotConfirmed {
         if let Some(slot) = pending.slot {
-            let booking = system.bookings.get(&slot).ok_or_else(|| {
-                format!("Confirmed booking not found at slot {:?}", slot)
-            })?;
+            let booking = system
+                .bookings
+                .get(&slot)
+                .ok_or_else(|| format!("Confirmed booking not found at slot {:?}", slot))?;
 
             if booking.user_id != expected_user_id {
                 return Err(format!(
@@ -552,7 +553,9 @@ fn verify_auto_selection_preferences(
     }
 
     // Verify time preference
-    let time_matches = preferred_times.iter().any(|range| range.contains(slot.time));
+    let time_matches = preferred_times
+        .iter()
+        .any(|range| range.contains(slot.time));
     if !time_matches {
         return Err(format!(
             "Auto-selected time {} not in any preferred time range",
@@ -654,7 +657,9 @@ async fn run_booking_preferences_test(seed: u64) -> Result<TestStats, String> {
         let times = random_time_ranges(&mut rng, time_count);
         let apt_type = random_apt_type(&mut rng);
 
-        if let Ok(req_id) = request_auto(&mut system, user_id, days.clone(), times.clone(), apt_type).await {
+        if let Ok(req_id) =
+            request_auto(&mut system, user_id, days.clone(), times.clone(), apt_type).await
+        {
             stats.total_operations += 1;
 
             // Verify auto-selection respected preferences

@@ -31,7 +31,7 @@ async fn test_basic_booking_flow() {
         &mut system,
         Input::TrackedActionCompleted {
             id: req_id,
-            res: PaymentResult::Success { amount: 75.0 },
+            result: PaymentResult::Success { amount: 75.0 },
         },
         &mut actions,
     )
@@ -92,7 +92,7 @@ async fn test_slot_conflict() {
         &mut system,
         Input::TrackedActionCompleted {
             id: alice_req,
-            res: PaymentResult::Success { amount: 75.0 },
+            result: PaymentResult::Success { amount: 75.0 },
         },
         &mut actions,
     )
@@ -184,7 +184,7 @@ async fn test_auto_selection() {
         &mut system,
         Input::TrackedActionCompleted {
             id: req_id,
-            res: PaymentResult::Success { amount: 75.0 },
+            result: PaymentResult::Success { amount: 75.0 },
         },
         &mut actions,
     )
@@ -236,7 +236,7 @@ async fn test_invariants_after_operations() {
                 &mut system,
                 Input::TrackedActionCompleted {
                     id: req_id,
-                    res: PaymentResult::Success { amount: 75.0 },
+                    result: PaymentResult::Success { amount: 75.0 },
                 },
                 &mut actions,
             )
@@ -329,7 +329,7 @@ async fn test_booking_preferences_honored() {
         &mut system,
         Input::TrackedActionCompleted {
             id: req_id_1,
-            res: PaymentResult::Success {
+            result: PaymentResult::Success {
                 amount: AptType::Filling.price(),
             },
         },
@@ -419,7 +419,7 @@ async fn test_booking_preferences_honored() {
         &mut system,
         Input::TrackedActionCompleted {
             id: req_id_2,
-            res: PaymentResult::Success {
+            result: PaymentResult::Success {
                 amount: AptType::RootCanal.price(),
             },
         },
@@ -477,7 +477,7 @@ async fn test_booking_preferences_honored() {
             &mut system,
             Input::TrackedActionCompleted {
                 id: req_id,
-                res: PaymentResult::Success {
+                result: PaymentResult::Success {
                     amount: apt_type.price(),
                 },
             },

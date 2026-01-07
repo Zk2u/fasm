@@ -182,25 +182,6 @@ fn simple_validation(state: &State, input: Input) -> Result<()> {
 }
 ```
 
-### Poll Optimization
-
-```rust
-impl Future for StfFuture {
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // ✅ Extract data early to avoid borrow issues
-        let input_data = match &self.input {
-            Input::Normal(data) => data.clone(),
-            Input::TrackedActionCompleted { id, res } => {
-                return self.handle_completion(*id, res);
-            }
-        };
-        
-        // Now can freely mutate self
-        self.handle_normal_input(input_data)
-    }
-}
-```
-
 ## Memory Efficiency
 
 ### Use Compact Representations

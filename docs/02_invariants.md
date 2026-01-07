@@ -479,8 +479,6 @@ async fn restore(state: &State, actions: &mut Actions) -> Result<()> {
 
 // ✅ Pure function of state
 async fn restore(state: &State, actions: &mut Actions) -> Result<()> {
-    actions.clear()?;
-    
     // Only use state
     for (payment_id, payment) in &state.pending_payments {
         if payment.status == Pending {
@@ -509,19 +507,19 @@ If restore has external dependencies:
 ```rust
 // ❌ Ignoring result
 match input {
-    TrackedActionCompleted { id, res } => {
-        log::info!("Got result for {}: {:?}", id, res);
+    TrackedActionCompleted { id, result } => {
+        log::info!("Got result for {}: {:?}", id, result);
         Ok(()) // State unchanged!
     }
 }
 
 // ✅ Update state with result
 match input {
-    TrackedActionCompleted { id, res } => {
+    TrackedActionCompleted { id, result } => {
         let payment = state.pending_payments.get_mut(&id)
             .ok_or(UnknownPayment)?;
         
-        payment.status = match res {
+        payment.status = match result {
             PaymentSuccess { txn_id } => {
                 payment.transaction_id = Some(txn_id);
                 Confirmed

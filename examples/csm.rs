@@ -1,8 +1,6 @@
-use std::{
-    future,
-    pin::Pin,
-    task::{Context, Poll},
-};
+//! Simple counter state machine example.
+//!
+//! Demonstrates the basic PHASM pattern with the simplified 2024 async syntax.
 
 use phasm::{
     Input, StateMachine,
@@ -42,7 +40,7 @@ struct CounterStateMachine {
 }
 
 #[derive(Debug)]
-enum CsmStfError {
+enum CsmError {
     Overflowed,
     FailedToQueueAction,
 }
@@ -62,60 +60,41 @@ impl TrackedActionTypes for CsmTrackedAction {
 }
 
 impl StateMachine for CounterStateMachine {
-    type UntrackedAction = CsmAction;
-    type TrackedAction = CsmTrackedAction;
-    type Actions = Vec<Action<Self::UntrackedAction, Self::TrackedAction>>;
-
     type State = Self;
     type Input = ();
-
-    type TransitionError = CsmStfError;
+    type TrackedAction = CsmTrackedAction;
+    type UntrackedAction = CsmAction;
+    type Actions = Vec<Action<Self::UntrackedAction, Self::TrackedAction>>;
+    type TransitionError = CsmError;
     type RestoreError = ();
 
-    type StfFuture<'state, 'actions> = CsmStfFuture<'state, 'actions>;
-    type RestoreFuture<'state, 'actions> = future::Ready<Result<(), Self::RestoreError>>;
-
-    fn stf<'state, 'actions>(
+    async fn stf<'state, 'actions>(
         state: &'state mut Self::State,
         _input: Input<Self::TrackedAction, Self::Input>,
         actions: &'actions mut Self::Actions,
-    ) -> Self::StfFuture<'state, 'actions> {
-        CsmStfFuture { state, actions }
+    ) -> Result<(), Self::TransitionError> {
+        let prev = state.counter;
+        let new = state.counter.checked_add(1).ok_or(CsmError::Overflowed)?;
+
+        // Fallible operation first
+        actions
+            .add(Action::Untracked(CsmAction::Incremented {
+                from: prev,
+                to: new,
+            }))
+            .map_err(|_| CsmError::FailedToQueueAction)?;
+
+        // Then mutate state
+        state.counter = new;
+
+        Ok(())
     }
 
-    fn restore<'state, 'actions>(
+    async fn restore<'state, 'actions>(
         _state: &'state Self::State,
         _actions: &'actions mut Self::Actions,
-    ) -> Self::RestoreFuture<'state, 'actions> {
-        future::ready(Ok(()))
-    }
-}
-
-struct CsmStfFuture<'state, 'actions> {
-    state: &'state mut CounterStateMachine,
-    actions: &'actions mut <CounterStateMachine as StateMachine>::Actions,
-}
-
-impl<'state, 'actions> Future for CsmStfFuture<'state, 'actions> {
-    type Output = Result<(), <CounterStateMachine as StateMachine>::TransitionError>;
-
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let result = (|| {
-            let prev = self.state.counter;
-            let new = self
-                .state
-                .counter
-                .checked_add(1)
-                .ok_or(CsmStfError::Overflowed)?;
-            self.state.counter = new;
-            self.actions
-                .add(Action::Untracked(CsmAction::Incremented {
-                    from: prev,
-                    to: new,
-                }))
-                .map_err(|_| CsmStfError::FailedToQueueAction)?;
-            Ok(())
-        })();
-        Poll::Ready(result)
+    ) -> Result<(), Self::RestoreError> {
+        // No tracked actions to restore for this simple example
+        Ok(())
     }
 }

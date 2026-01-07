@@ -166,7 +166,7 @@ impl StateMachine for BookingSystem {
                 Ok(())
             }
             
-            Input::TrackedActionCompleted { id, res } => {
+            Input::TrackedActionCompleted { id, result } => {
                 // Update database state
                 let key = format!("pending/{}", id);
                 let mut pending: PendingRequest = state.txn
@@ -176,7 +176,7 @@ impl StateMachine for BookingSystem {
                     .as_ref()
                     .pipe(bincode::deserialize)?;
                 
-                pending.status = match res {
+                pending.status = match result {
                     Success => Confirmed,
                     Failed => Failed,
                 };
@@ -192,8 +192,6 @@ impl StateMachine for BookingSystem {
         state: &FdbState<'_>,
         actions: &mut Actions,
     ) -> Result<(), ()> {
-        actions.clear()?;
-        
         // Restore from database state
         let pending_list = state.list_pending().await.unwrap();
         
@@ -274,9 +272,9 @@ impl StateMachine for BookingSystem {
                 Ok(())
             }
             
-            Input::TrackedActionCompleted { id, res } => {
+            Input::TrackedActionCompleted { id, result } => {
                 // Update through transaction
-                let new_status = match res {
+                let new_status = match result {
                     Success => "confirmed",
                     Failed => "failed",
                 };
@@ -295,8 +293,6 @@ impl StateMachine for BookingSystem {
     }
     
     async fn restore(state: &PgState<'_>, actions: &mut Actions) -> Result<(), ()> {
-        actions.clear().ok();
-        
         // Query pending from database
         let pending = sqlx::query_as::<_, (i64, String)>(
             "SELECT id, slot_id FROM pending_requests WHERE status = 'awaiting_payment'"
@@ -308,7 +304,7 @@ impl StateMachine for BookingSystem {
         for (id, _slot_id) in pending {
             actions.add(Action::Tracked(
                 TrackedAction::new(id, CheckPaymentStatus { id })
-            )).ok();
+            )).map_err(|_| ())?;
         }
         
         Ok(())

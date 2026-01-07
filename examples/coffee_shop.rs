@@ -1,25 +1,20 @@
-use std::{
-    future,
-    pin::Pin,
-    task::{Context, Poll},
-};
+//! Coffee shop loyalty app state machine example.
+//!
+//! This example demonstrates:
+//! - Tracked actions: Point redemption that needs backend confirmation
+//! - Untracked actions: UI updates, notifications, animations
+//! - Restore: Recovering pending redemptions after crash
+//! - Atomicity: State unchanged on error
 
 use phasm::{
     Input, StateMachine,
     actions::{Action, ActionsContainer, TrackedAction, TrackedActionTypes},
 };
 
-/// Simulates a coffee shop loyalty app state machine.
-///
-/// This example demonstrates:
-/// - Tracked actions: Point redemption that needs backend confirmation
-/// - Untracked actions: UI updates, notifications, animations
-/// - Restore: Recovering pending redemptions after crash
 #[monoio::main]
 async fn main() {
     println!("=== Coffee Shop Loyalty App Demo ===\n");
 
-    // Initialize state with user having 150 points
     let mut app = CoffeeShopApp {
         user_id: 12345,
         points_balance: 150,
@@ -35,7 +30,7 @@ async fn main() {
     println!("  Order total: ${:.2}", app.order_total);
     println!("  Pending redemption: {:?}\n", app.pending_redemption);
 
-    // Scenario 1: User redeems 100 points for a free coffee ($5 off)
+    // Scenario 1: User redeems 100 points
     println!(">>> User taps 'Redeem 100 points for $5 off'\n");
 
     CoffeeShopApp::stf(
@@ -53,32 +48,19 @@ async fn main() {
     );
     println!("  Pending redemption: {:?}", app.pending_redemption);
     println!("\nActions produced:");
-
-    for (i, action) in actions.iter().enumerate() {
-        match action {
-            Action::Tracked(ta) => {
-                println!("  {}. [TRACKED] {:?}", i + 1, ta);
-                println!("     → Will wait for backend confirmation");
-            }
-            Action::Untracked(ua) => {
-                println!("  {}. [UNTRACKED] {:?}", i + 1, ua);
-            }
-        }
-    }
-
+    print_actions(&actions);
     actions.clear();
 
-    // Simulate backend confirming the redemption
+    // Backend confirms the redemption
     println!("\n>>> Backend confirms: Redemption successful!\n");
 
-    // Use the actual redemption ID from the pending redemption
     let redemption_id = app.pending_redemption.as_ref().unwrap().id.clone();
 
     CoffeeShopApp::stf(
         &mut app,
         Input::TrackedActionCompleted {
             id: redemption_id,
-            res: RedemptionResult::Success {
+            result: RedemptionResult::Success {
                 points_deducted: 100,
             },
         },
@@ -92,19 +74,10 @@ async fn main() {
     println!("  Order total: ${:.2}", app.order_total);
     println!("  Pending redemption: {:?}", app.pending_redemption);
     println!("\nActions produced:");
-
-    for (i, action) in actions.iter().enumerate() {
-        match action {
-            Action::Tracked(_) => unreachable!(),
-            Action::Untracked(ua) => {
-                println!("  {}. [UNTRACKED] {:?}", i + 1, ua);
-            }
-        }
-    }
-
+    print_actions(&actions);
     actions.clear();
 
-    // Scenario 2: Demonstrate error handling - user tries to redeem more points than available
+    // Scenario 2: Error handling - insufficient points
     println!("\n>>> User tries to redeem 200 points (only has 50 remaining)...\n");
 
     let points_before = app.points_balance;
@@ -129,35 +102,20 @@ async fn main() {
         "  Next redemption ID: {} (same as before)",
         app.next_redemption_id
     );
-    println!("  Actions produced: {} (empty)", actions.len());
 
-    // Verify atomicity - state should be completely unchanged
-    assert!(
-        result.is_err(),
-        "Should return error for insufficient points"
-    );
-    assert_eq!(
-        app.points_balance, points_before,
-        "Points should not change on error"
-    );
-    assert_eq!(
-        app.pending_redemption, pending_before,
-        "Pending should not change on error"
-    );
-    assert_eq!(
-        app.next_redemption_id, next_id_before,
-        "ID counter should not increment on error"
-    );
-    assert_eq!(actions.len(), 0, "No actions should be emitted on error");
+    // Verify atomicity
+    assert!(result.is_err());
+    assert_eq!(app.points_balance, points_before);
+    assert_eq!(app.pending_redemption, pending_before);
+    assert_eq!(app.next_redemption_id, next_id_before);
+    assert_eq!(actions.len(), 0);
 
     println!("\n✓ STF Atomicity verified: State unchanged after error\n");
-
     actions.clear();
 
-    // Demonstrate restore functionality
+    // Scenario 3: Restore after crash
     println!(">>> Simulating app crash and restore...\n");
 
-    // Create new app state with a pending redemption (simulating crash during redemption)
     let crashed_app = CoffeeShopApp {
         user_id: 12345,
         points_balance: 150,
@@ -178,17 +136,22 @@ async fn main() {
         .unwrap();
 
     println!("\nRestore produced {} action(s) to retry:", actions.len());
+    print_actions(&actions);
+
+    println!("\n=== Demo Complete ===");
+}
+
+fn print_actions(actions: &[Action<UntrackedAction, CoffeeTrackedAction>]) {
     for (i, action) in actions.iter().enumerate() {
         match action {
             Action::Tracked(ta) => {
                 println!("  {}. [TRACKED] {:?}", i + 1, ta);
-                println!("     → Will requery backend to check redemption status");
             }
-            Action::Untracked(_) => unreachable!(),
+            Action::Untracked(ua) => {
+                println!("  {}. [UNTRACKED] {:?}", i + 1, ua);
+            }
         }
     }
-
-    println!("\n=== Demo Complete ===");
 }
 
 // ============================================================================
@@ -200,19 +163,15 @@ struct CoffeeShopApp {
     points_balance: u32,
     pending_redemption: Option<PendingRedemption>,
     order_total: f32,
-    // INVARIANT: Deterministic ID generation (Invariant #4)
-    // Counter must be stored in state, NOT generated from SystemTime or random
     next_redemption_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct PendingRedemption {
     id: RedemptionId,
-    #[allow(dead_code)]
     points: u32,
 }
 
-// User input to the state machine
 #[derive(Debug)]
 enum UserAction {
     RedeemPoints {
@@ -222,7 +181,6 @@ enum UserAction {
     CancelOrder,
 }
 
-// Errors that can occur during state transitions
 #[derive(Debug)]
 enum CoffeeShopError {
     InsufficientPoints,
@@ -232,7 +190,7 @@ enum CoffeeShopError {
 }
 
 // ============================================================================
-// Tracked Actions - Need backend confirmation
+// Tracked Actions
 // ============================================================================
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -267,7 +225,7 @@ impl TrackedActionTypes for CoffeeTrackedAction {
 }
 
 // ============================================================================
-// Untracked Actions - Fire and forget (UI, notifications, logs)
+// Untracked Actions
 // ============================================================================
 
 #[derive(Debug, PartialEq, Eq)]
@@ -287,278 +245,199 @@ enum UntrackedAction {
 // ============================================================================
 
 impl StateMachine for CoffeeShopApp {
-    type UntrackedAction = UntrackedAction;
-    type TrackedAction = CoffeeTrackedAction;
-    type Actions = Vec<Action<Self::UntrackedAction, Self::TrackedAction>>;
-
     type State = Self;
     type Input = UserAction;
-
+    type TrackedAction = CoffeeTrackedAction;
+    type UntrackedAction = UntrackedAction;
+    type Actions = Vec<Action<Self::UntrackedAction, Self::TrackedAction>>;
     type TransitionError = CoffeeShopError;
-    type RestoreError = ();
+    type RestoreError = CoffeeShopError;
 
-    type StfFuture<'state, 'actions> = CoffeeStfFuture<'state, 'actions>;
-    type RestoreFuture<'state, 'actions> = future::Ready<Result<(), Self::RestoreError>>;
-
-    fn stf<'state, 'actions>(
+    async fn stf<'state, 'actions>(
         state: &'state mut Self::State,
         input: Input<Self::TrackedAction, Self::Input>,
         actions: &'actions mut Self::Actions,
-    ) -> Self::StfFuture<'state, 'actions> {
-        CoffeeStfFuture {
-            state,
-            actions,
-            input,
+    ) -> Result<(), Self::TransitionError> {
+        match input {
+            Input::Normal(UserAction::RedeemPoints { points }) => {
+                handle_redeem_points(state, actions, points)
+            }
+            Input::Normal(UserAction::CancelOrder) => {
+                state.pending_redemption = None;
+                Ok(())
+            }
+            Input::TrackedActionCompleted { id, result } => match result {
+                RedemptionResult::Success { points_deducted } => {
+                    handle_redemption_success(state, actions, &id, points_deducted)
+                }
+                RedemptionResult::Failed { reason } => {
+                    handle_redemption_failed(state, actions, &id, reason)
+                }
+                RedemptionResult::Pending => {
+                    // Verify ID matches, otherwise no-op
+                    let pending = state
+                        .pending_redemption
+                        .as_ref()
+                        .ok_or(CoffeeShopError::InvalidRedemptionId)?;
+                    if &pending.id != &id {
+                        return Err(CoffeeShopError::InvalidRedemptionId);
+                    }
+                    Ok(())
+                }
+            },
         }
     }
 
-    fn restore<'state, 'actions>(
+    async fn restore<'state, 'actions>(
         state: &'state Self::State,
         actions: &'actions mut Self::Actions,
-    ) -> Self::RestoreFuture<'state, 'actions> {
-        // Clear the actions container first to reuse allocation
-        let _ = actions.clear();
-
-        // If there's a pending redemption, we need to check its status with the backend
+    ) -> Result<(), Self::RestoreError> {
         if let Some(pending) = &state.pending_redemption {
-            // Create a tracked action to requery the backend about this redemption
-            let _ = actions.add(Action::Tracked(TrackedAction::new(
-                pending.id.clone(),
-                RedemptionRequest::CheckStatus {
-                    redemption_id: pending.id.clone(),
-                },
-            )));
+            actions
+                .add(Action::Tracked(TrackedAction::new(
+                    pending.id.clone(),
+                    RedemptionRequest::CheckStatus {
+                        redemption_id: pending.id.clone(),
+                    },
+                )))
+                .map_err(|_| CoffeeShopError::FailedToQueueAction)?;
         }
 
-        future::ready(Ok(()))
+        Ok(())
     }
 }
 
 // ============================================================================
-// State Transition Future
+// Handler Functions
 // ============================================================================
 
-struct CoffeeStfFuture<'state, 'actions> {
-    state: &'state mut CoffeeShopApp,
-    actions: &'actions mut <CoffeeShopApp as StateMachine>::Actions,
-    input: Input<
-        <CoffeeShopApp as StateMachine>::TrackedAction,
-        <CoffeeShopApp as StateMachine>::Input,
-    >,
+fn handle_redeem_points(
+    state: &mut CoffeeShopApp,
+    actions: &mut Vec<Action<UntrackedAction, CoffeeTrackedAction>>,
+    points: u32,
+) -> Result<(), CoffeeShopError> {
+    // Validation
+    if state.pending_redemption.is_some() {
+        return Err(CoffeeShopError::RedemptionAlreadyPending);
+    }
+    if state.points_balance < points {
+        return Err(CoffeeShopError::InsufficientPoints);
+    }
+
+    // Prepare values (no mutation yet)
+    let redemption_id = RedemptionId(state.next_redemption_id);
+
+    // Fallible operations first
+    actions
+        .add(Action::Tracked(TrackedAction::new(
+            redemption_id.clone(),
+            RedemptionRequest::Redeem {
+                user_id: state.user_id,
+                points,
+            },
+        )))
+        .map_err(|_| CoffeeShopError::FailedToQueueAction)?;
+
+    actions
+        .add(Action::Untracked(UntrackedAction::ShowStampAnimation))
+        .map_err(|_| CoffeeShopError::FailedToQueueAction)?;
+
+    actions
+        .add(Action::Untracked(UntrackedAction::LogAnalytics {
+            event: format!("redemption_requested:{}", points),
+        }))
+        .map_err(|_| CoffeeShopError::FailedToQueueAction)?;
+
+    // Now mutate state
+    state.next_redemption_id += 1;
+    state.pending_redemption = Some(PendingRedemption {
+        id: redemption_id,
+        points,
+    });
+
+    Ok(())
 }
 
-impl<'state, 'actions> Future for CoffeeStfFuture<'state, 'actions> {
-    type Output = Result<(), <CoffeeShopApp as StateMachine>::TransitionError>;
-
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Extract input data before calling handlers to avoid borrow checker issues
-        enum InputAction {
-            RedeemPoints {
-                points: u32,
-            },
-            CancelOrder,
-            RedemptionSuccess {
-                id: RedemptionId,
-                points_deducted: u32,
-            },
-            RedemptionFailed {
-                id: RedemptionId,
-                reason: String,
-            },
-            RedemptionPending {
-                id: RedemptionId,
-            },
-        }
-
-        let action = match &self.input {
-            Input::Normal(UserAction::RedeemPoints { points }) => {
-                InputAction::RedeemPoints { points: *points }
-            }
-            Input::Normal(UserAction::CancelOrder) => InputAction::CancelOrder,
-            Input::TrackedActionCompleted { id, res } => match res {
-                RedemptionResult::Success { points_deducted } => InputAction::RedemptionSuccess {
-                    id: id.clone(),
-                    points_deducted: *points_deducted,
-                },
-                RedemptionResult::Failed { reason } => InputAction::RedemptionFailed {
-                    id: id.clone(),
-                    reason: reason.clone(),
-                },
-                RedemptionResult::Pending => InputAction::RedemptionPending { id: id.clone() },
-            },
-        };
-
-        let result = match action {
-            InputAction::RedeemPoints { points } => self.handle_redeem_points(points),
-            InputAction::CancelOrder => self.handle_cancel_order(),
-            InputAction::RedemptionSuccess {
-                id,
-                points_deducted,
-            } => self.handle_redemption_success(&id, points_deducted),
-            InputAction::RedemptionFailed { id, reason } => {
-                self.handle_redemption_failed(&id, reason)
-            }
-            InputAction::RedemptionPending { id } => self.handle_redemption_pending(&id),
-        };
-
-        Poll::Ready(result)
+fn handle_redemption_success(
+    state: &mut CoffeeShopApp,
+    actions: &mut Vec<Action<UntrackedAction, CoffeeTrackedAction>>,
+    id: &RedemptionId,
+    points_deducted: u32,
+) -> Result<(), CoffeeShopError> {
+    // Validate
+    let pending = state
+        .pending_redemption
+        .as_ref()
+        .ok_or(CoffeeShopError::InvalidRedemptionId)?;
+    if &pending.id != id {
+        return Err(CoffeeShopError::InvalidRedemptionId);
     }
+
+    // Update state
+    state.points_balance -= points_deducted;
+    let discount = (points_deducted as f32) * 0.05;
+    state.order_total = (state.order_total - discount).max(0.0);
+    state.pending_redemption = None;
+
+    // Emit UI actions
+    actions
+        .add(Action::Untracked(UntrackedAction::UpdatePointsDisplay {
+            new_balance: state.points_balance,
+        }))
+        .map_err(|_| CoffeeShopError::FailedToQueueAction)?;
+
+    actions
+        .add(Action::Untracked(UntrackedAction::UpdateOrderTotal {
+            new_total_cents: (state.order_total * 100.0) as u32,
+        }))
+        .map_err(|_| CoffeeShopError::FailedToQueueAction)?;
+
+    actions
+        .add(Action::Untracked(UntrackedAction::ShowSuccessMessage {
+            message: format!(
+                "Redeemed {} points! Saved ${:.2}",
+                points_deducted, discount
+            ),
+        }))
+        .map_err(|_| CoffeeShopError::FailedToQueueAction)?;
+
+    actions
+        .add(Action::Untracked(UntrackedAction::PlaySuccessSound))
+        .map_err(|_| CoffeeShopError::FailedToQueueAction)?;
+
+    actions
+        .add(Action::Untracked(UntrackedAction::SendPushNotification {
+            message: "Your reward has been applied!".to_string(),
+        }))
+        .map_err(|_| CoffeeShopError::FailedToQueueAction)?;
+
+    Ok(())
 }
 
-impl<'state, 'actions> CoffeeStfFuture<'state, 'actions> {
-    fn handle_redeem_points(&mut self, points: u32) -> Result<(), CoffeeShopError> {
-        // Check if we already have a pending redemption
-        if self.state.pending_redemption.is_some() {
-            return Err(CoffeeShopError::RedemptionAlreadyPending);
-        }
-
-        // Check if user has enough points
-        if self.state.points_balance < points {
-            return Err(CoffeeShopError::InsufficientPoints);
-        }
-
-        // Generate a deterministic redemption ID from state (don't mutate yet)
-        let redemption_id = RedemptionId(self.state.next_redemption_id);
-
-        // Perform all fallible operations BEFORE mutating state
-        // Create tracked action to send to backend
-        self.actions
-            .add(Action::Tracked(TrackedAction::new(
-                redemption_id.clone(),
-                RedemptionRequest::Redeem {
-                    user_id: self.state.user_id,
-                    points,
-                },
-            )))
-            .map_err(|_| CoffeeShopError::FailedToQueueAction)?;
-
-        // Show UI feedback (untracked - fire and forget)
-        self.actions
-            .add(Action::Untracked(UntrackedAction::ShowStampAnimation))
-            .map_err(|_| CoffeeShopError::FailedToQueueAction)?;
-
-        self.actions
-            .add(Action::Untracked(UntrackedAction::LogAnalytics {
-                event: format!("redemption_requested:{}", points),
-            }))
-            .map_err(|_| CoffeeShopError::FailedToQueueAction)?;
-
-        // All fallible operations succeeded - NOW mutate state
-        self.state.next_redemption_id += 1;
-
-        // Store pending redemption in state (for crash recovery)
-        self.state.pending_redemption = Some(PendingRedemption {
-            id: redemption_id.clone(),
-            points,
-        });
-
-        Ok(())
+fn handle_redemption_failed(
+    state: &mut CoffeeShopApp,
+    actions: &mut Vec<Action<UntrackedAction, CoffeeTrackedAction>>,
+    id: &RedemptionId,
+    reason: String,
+) -> Result<(), CoffeeShopError> {
+    // Validate
+    let pending = state
+        .pending_redemption
+        .as_ref()
+        .ok_or(CoffeeShopError::InvalidRedemptionId)?;
+    if &pending.id != id {
+        return Err(CoffeeShopError::InvalidRedemptionId);
     }
 
-    fn handle_cancel_order(&mut self) -> Result<(), CoffeeShopError> {
-        // Cancel any pending redemptions
-        self.state.pending_redemption = None;
-        Ok(())
-    }
+    // Update state
+    state.pending_redemption = None;
 
-    fn handle_redemption_success(
-        &mut self,
-        id: &RedemptionId,
-        points_deducted: u32,
-    ) -> Result<(), CoffeeShopError> {
-        // Verify this is the redemption we're waiting for
-        let pending = self
-            .state
-            .pending_redemption
-            .as_ref()
-            .ok_or(CoffeeShopError::InvalidRedemptionId)?;
+    // Show error
+    actions
+        .add(Action::Untracked(UntrackedAction::ShowErrorMessage {
+            message: format!("Redemption failed: {}", reason),
+        }))
+        .map_err(|_| CoffeeShopError::FailedToQueueAction)?;
 
-        if &pending.id != id {
-            return Err(CoffeeShopError::InvalidRedemptionId);
-        }
-
-        // Backend confirmed! Update our state
-        self.state.points_balance -= points_deducted;
-        let discount = (points_deducted as f32) * 0.05; // 100 points = $5
-        self.state.order_total = (self.state.order_total - discount).max(0.0);
-        self.state.pending_redemption = None;
-
-        // Emit untracked actions for UI updates
-        self.actions
-            .add(Action::Untracked(UntrackedAction::UpdatePointsDisplay {
-                new_balance: self.state.points_balance,
-            }))
-            .map_err(|_| CoffeeShopError::FailedToQueueAction)?;
-
-        self.actions
-            .add(Action::Untracked(UntrackedAction::UpdateOrderTotal {
-                new_total_cents: (self.state.order_total * 100.0) as u32,
-            }))
-            .map_err(|_| CoffeeShopError::FailedToQueueAction)?;
-
-        self.actions
-            .add(Action::Untracked(UntrackedAction::ShowSuccessMessage {
-                message: format!(
-                    "Redeemed {} points! Saved ${:.2}",
-                    points_deducted, discount
-                ),
-            }))
-            .map_err(|_| CoffeeShopError::FailedToQueueAction)?;
-
-        self.actions
-            .add(Action::Untracked(UntrackedAction::PlaySuccessSound))
-            .map_err(|_| CoffeeShopError::FailedToQueueAction)?;
-
-        self.actions
-            .add(Action::Untracked(UntrackedAction::SendPushNotification {
-                message: "Your reward has been applied!".to_string(),
-            }))
-            .map_err(|_| CoffeeShopError::FailedToQueueAction)?;
-
-        Ok(())
-    }
-
-    fn handle_redemption_failed(
-        &mut self,
-        id: &RedemptionId,
-        reason: String,
-    ) -> Result<(), CoffeeShopError> {
-        // Verify this is the redemption we're waiting for
-        let pending = self
-            .state
-            .pending_redemption
-            .as_ref()
-            .ok_or(CoffeeShopError::InvalidRedemptionId)?;
-
-        if &pending.id != id {
-            return Err(CoffeeShopError::InvalidRedemptionId);
-        }
-
-        // Backend rejected the redemption
-        self.state.pending_redemption = None;
-
-        self.actions
-            .add(Action::Untracked(UntrackedAction::ShowErrorMessage {
-                message: format!("Redemption failed: {}", reason),
-            }))
-            .map_err(|_| CoffeeShopError::FailedToQueueAction)?;
-
-        Ok(())
-    }
-
-    fn handle_redemption_pending(&mut self, id: &RedemptionId) -> Result<(), CoffeeShopError> {
-        // Verify this is the redemption we're waiting for
-        let pending = self
-            .state
-            .pending_redemption
-            .as_ref()
-            .ok_or(CoffeeShopError::InvalidRedemptionId)?;
-
-        if &pending.id != id {
-            return Err(CoffeeShopError::InvalidRedemptionId);
-        }
-
-        // Still processing, keep waiting
-        Ok(())
-    }
+    Ok(())
 }

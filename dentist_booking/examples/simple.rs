@@ -32,7 +32,7 @@ async fn main() {
         &mut system,
         Input::TrackedActionCompleted {
             id: req_id,
-            res: PaymentResult::Success { amount: 75.0 },
+            result: PaymentResult::Success { amount: 75.0 },
         },
         &mut actions,
     )

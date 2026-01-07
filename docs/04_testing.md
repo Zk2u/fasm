@@ -173,7 +173,7 @@ async fn test_crash_recovery() {
                         &mut state,
                         Input::TrackedActionCompleted { 
                             id: tracked.action_id, 
-                            res: result 
+                            result, 
                         },
                         &mut actions,
                     ).await.ok();

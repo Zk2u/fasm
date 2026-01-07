@@ -1,285 +1,368 @@
-//! Phallible ASync State Machines (PHASM)
+//! # PHASM - Fallible Async State Machines
 //!
 //! A framework for building deterministic, testable, and crash-recoverable state machines
 //! with async operations and fallible state access.
 //!
-//! # Core Concept
+//! ## Core Concept
 //!
 //! PHASM separates state machine logic from external side effects:
-//! - **State Transition Function (STF)**: Deterministic logic that mutates state (including
-//!   database transactions accessed via the `state` parameter), validates inputs, and emits
-//!   action descriptions for external operations
-//! - **Actions**: Descriptions of external side effects (HTTP calls to other services,
-//!   notifications, analytics) that are executed *after* STF completes successfully
-//! - **State**: Can be in-memory structs, database transactions, or any storage accessed
-//!   through the `state` parameter. Mutations to state are NOT side effects.
-//! - **Restore**: Recovers pending operations from persisted state after crashes
 //!
-//! # Critical Invariants
+//! - **State Transition Function (STF)**: A deterministic function that reads state and input,
+//!   validates transitions, mutates state, and emits action descriptions.
+//! - **Actions**: Descriptions of side effects (HTTP calls, notifications, analytics) executed
+//!   *after* the STF completes successfully and state is committed.
+//! - **State**: Can be in-memory structs, database transactions, or any storage accessed through
+//!   the `state` parameter. State mutations are part of the transaction, not side effects.
+//! - **Restore**: Rebuilds pending actions from persisted state after crashes.
 //!
-//! For a PHASM state machine to be theoretically sound:
+//! ## Execution Model
 //!
-//! 1. **STF Atomicity**: If STF returns `Err`, state MUST be unchanged
-//! 2. **Determinism**: Same state + same input = same output (always)
-//! 3. **State Validity**: State must satisfy invariants at all times
-//! 4. **No External Side Effects**: STF mutates state (including database writes via `state`)
-//!    and emits action descriptions, but must not make HTTP calls or access external services
-//! 5. **Tracked Actions in State**: Store pending tracked actions in state before emitting
-//!
-//! See module documentation in `docs/` for detailed rules and best practices.
-//!
-//! # Example
+//! The runtime executes an STF like this:
 //!
 //! ```ignore
-//! struct MyStateMachine {
-//!     counter: u64,
-//!     pending_ops: HashMap<u64, PendingOp>,
+//! let mut txn = db.begin_transaction().await?;
+//! let mut actions = Vec::new();
+//!
+//! match Machine::stf(&mut txn, input, &mut actions).await {
+//!     Ok(()) => {
+//!         txn.commit().await?;           // Commit state changes
+//!         execute_actions(actions).await; // Then execute side effects
+//!     }
+//!     Err(e) => {
+//!         txn.abort().await;  // Rollback state
+//!         actions.clear();    // Discard actions
+//!         return Err(e);
+//!     }
+//! }
+//! ```
+//!
+//! **Key insight**: One STF call = one atomic state transaction. All state operations within
+//! the STF are part of that transaction. Actions are only executed after successful commit.
+//!
+//! ## Atomicity
+//!
+//! PHASM provides atomicity through two mechanisms:
+//!
+//! ### Transactional State (Database-backed)
+//!
+//! If your state is a database transaction, atomicity is provided by the storage layer:
+//!
+//! ```ignore
+//! async fn stf(txn: &mut DbTransaction, input: Input, actions: &mut Actions) -> Result<()> {
+//!     let user = txn.get("user:123").await?;     // Part of transaction
+//!     txn.set("balance", new_balance).await?;    // Part of transaction
+//!     txn.set("pending", request).await?;        // Part of transaction
+//!
+//!     actions.add(Action::Tracked(...))?;        // Buffered, executed after commit
+//!     Ok(())
+//!     // If any operation fails, transaction aborts and all changes are rolled back
+//! }
+//! ```
+//!
+//! ### In-Memory State
+//!
+//! For in-memory state not covered by a transaction, you must ensure atomicity manually
+//! by performing fallible operations before mutating state:
+//!
+//! ```ignore
+//! async fn stf(state: &mut InMemoryState, input: Input, actions: &mut Actions) -> Result<()> {
+//!     // 1. Validation (can fail)
+//!     if state.balance < amount {
+//!         return Err(InsufficientFunds);
+//!     }
+//!
+//!     // 2. Prepare values (no mutation yet)
+//!     let id = state.next_id;
+//!
+//!     // 3. State mutation (after all validation)
+//!     state.next_id += 1;
+//!     state.pending.insert(id, request);
+//!
+//!     // 4. Emit actions
+//!     actions.add(Action::Tracked(...))?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## Critical Invariants
+//!
+//! 1. **Atomicity**: If STF returns `Err`, state must be unchanged (enforced by transaction
+//!    or by careful ordering of operations).
+//!
+//! 2. **Determinism**: Same state + same input = same output. No randomness, system time,
+//!    or external I/O in the STF. All external data comes through `input`.
+//!
+//! 3. **No Side Effects**: STF only mutates state and emits action *descriptions*. Actual
+//!    side effects (HTTP calls, sending emails) happen after commit.
+//!
+//! 4. **Tracked Actions in State**: Before emitting a tracked action, store enough data
+//!    in state that `restore()` can recreate it after a crash.
+//!
+//! 5. **Restore is Pure**: `restore()` only reads from the state parameter. It cannot
+//!    make external queries.
+//!
+//! ## Example
+//!
+//! ```ignore
+//! use phasm::{StateMachine, Input, actions::{Action, TrackedAction, TrackedActionTypes}};
+//!
+//! struct MySystem {
+//!     balance: u64,
+//!     pending: HashMap<u64, Request>,
+//!     next_id: u64,
 //! }
 //!
-//! impl StateMachine for MyStateMachine {
-//!     // Define your state machine...
+//! struct MyTracked;
+//! impl TrackedActionTypes for MyTracked {
+//!     type Id = u64;
+//!     type Action = PaymentRequest;
+//!     type Result = PaymentResult;
 //! }
+//!
+//! impl StateMachine for MySystem {
+//!     type State = Self;
+//!     type Input = UserRequest;
+//!     type TrackedAction = MyTracked;
+//!     type UntrackedAction = Notification;
+//!     type Actions = Vec<Action<Self::UntrackedAction, Self::TrackedAction>>;
+//!     type TransitionError = MyError;
+//!     type RestoreError = ();
+//!
+//!     async fn stf<'s, 'a>(
+//!         state: &'s mut Self::State,
+//!         input: Input<Self::TrackedAction, Self::Input>,
+//!         actions: &'a mut Self::Actions,
+//!     ) -> Result<(), Self::TransitionError> {
+//!         match input {
+//!             Input::Normal(request) => {
+//!                 // Handle user request...
+//!             }
+//!             Input::TrackedActionCompleted { id, result } => {
+//!                 // Handle action completion...
+//!             }
+//!         }
+//!         Ok(())
+//!     }
+//!
+//!     async fn restore<'s, 'a>(
+//!         state: &'s Self::State,
+//!         actions: &'a mut Self::Actions,
+//!     ) -> Result<(), Self::RestoreError> {
+//!         for (&id, pending) in &state.pending {
+//!             actions.add(Action::Tracked(TrackedAction::new(id, ...)))?;
+//!         }
+//!         Ok(())
+//!     }
+//! }
+//! ```
+//!
+//! ## Testing
+//!
+//! PHASM enables deterministic simulation testing:
+//!
+//! ```ignore
+//! let mut rng = ChaCha8Rng::seed_from_u64(12345);
+//! for _ in 0..10000 {
+//!     let input = generate_random_input(&mut rng);
+//!     Machine::stf(&mut state, input, &mut actions).await?;
+//!     state.check_invariants()?;
+//! }
+//! // Same seed = same execution = reproducible bugs
 //! ```
 
 pub mod actions;
 
+use std::future::Future;
+
 use crate::actions::{ActionsContainer, TrackedActionTypes};
 
-/// Input to a state machine's STF.
+/// Input to the state transition function.
 ///
 /// # Variants
 ///
-/// - [`Input::Normal`]: Regular input from users or external systems
-/// - [`Input::TrackedActionCompleted`]: Result of a tracked action that was previously emitted
+/// - [`Input::Normal`]: Regular input from users or external systems.
+/// - [`Input::TrackedActionCompleted`]: Result of a tracked action that was previously emitted.
 ///
-/// # Important
+/// # Determinism
 ///
-/// All external data (time, database reads, API responses) MUST be included in the input.
-/// STF should never make external reads - it must be a pure function of state and input.
+/// All external data (timestamps, random values, API responses) MUST be included in the input.
+/// The STF must be a pure function of state and input.
 ///
 /// ```ignore
-/// // ❌ WRONG
-/// fn stf(state: &mut State, input: UserRequest) {
-///     let now = SystemTime::now(); // Non-deterministic!
+/// // ❌ WRONG - Non-deterministic
+/// async fn stf(state: &mut State, input: Input<..., UserRequest>, ...) {
+///     let now = SystemTime::now();  // Non-deterministic!
+///     let id = Uuid::new_v4();       // Non-deterministic!
 /// }
 ///
-/// // ✅ CORRECT
-/// fn stf(state: &mut State, input: Input<_, (UserRequest, SystemTime)>) {
-///     let (request, timestamp) = match input {
-///         Input::Normal((req, ts)) => (req, ts),
+/// // ✅ CORRECT - All external data in input
+/// struct TimestampedRequest {
+///     request: UserRequest,
+///     timestamp: SystemTime,
+/// }
+///
+/// async fn stf(state: &mut State, input: Input<..., TimestampedRequest>, ...) {
+///     let TimestampedRequest { request, timestamp } = match input {
+///         Input::Normal(req) => req,
 ///         ...
 ///     };
+///     // Use timestamp from input, not SystemTime::now()
 /// }
 /// ```
 pub enum Input<TA: TrackedActionTypes, T> {
+    /// Normal input from external sources (user requests, events, etc.)
     Normal(T),
-    TrackedActionCompleted { id: TA::Id, res: TA::Result },
+
+    /// Result of a previously emitted tracked action.
+    TrackedActionCompleted {
+        /// The ID of the completed action (matches what was in [`TrackedAction::id`](actions::TrackedAction::id)).
+        id: TA::Id,
+        /// The result of the action.
+        result: TA::Result,
+    },
 }
 
-/// A trait for describing a fallible, asynchronous state machine.
+/// A deterministic, recoverable async state machine.
 ///
-/// # Theory of Operation
+/// # Overview
 ///
-/// A PHASM state machine is a deterministic function: `(State, Input) -> (State', Actions)`.
-/// The STF reads current state and input, validates transitions, updates state atomically,
-/// and emits actions describing side effects to perform.
+/// A PHASM state machine is conceptually a function:
 ///
-/// # Critical Rules for Correctness
-///
-/// ## 1. STF Atomicity
-///
-/// If STF returns `Err`, state MUST remain unchanged:
-///
-/// ```ignore
-/// // ✅ Validate before mutating
-/// if !self.state.is_valid_transition(input) {
-///     return Err(InvalidTransition); // State unchanged
-/// }
-/// self.state.apply(input); // Only mutate after validation
+/// ```text
+/// (State, Input) -> Result<(State', Actions), Error>
 /// ```
 ///
-/// ## 2. Determinism
+/// The STF reads current state and input, validates the transition, updates state atomically,
+/// and emits actions describing side effects to perform after commit.
 ///
-/// No randomness, system time, or external reads in STF:
+/// # Implementing
 ///
-/// ```ignore
-/// // ❌ Non-deterministic
-/// let id = Uuid::new_v4();
-/// let now = SystemTime::now();
-///
-/// // ✅ Deterministic - from state or input
-/// let id = self.state.next_id;
-/// self.state.next_id += 1;
-/// ```
-///
-/// ## 3. State Always Valid
-///
-/// After every STF (success or failure), invariants must hold:
+/// Implementations can use `async fn` syntax directly:
 ///
 /// ```ignore
-/// impl MyState {
-///     fn check_invariants(&self) -> Result<(), String> {
-///         // Verify no overlaps, consistency, etc.
+/// impl StateMachine for MyMachine {
+///     type State = MyState;
+///     type Input = MyInput;
+///     type TrackedAction = MyTracked;
+///     type UntrackedAction = MyUntracked;
+///     type Error = MyError;
+///
+///     async fn stf<'s, 'a>(
+///         state: &'s mut Self::State,
+///         input: Input<Self::TrackedAction, Self::Input>,
+///         actions: &'a mut Vec<Action<Self::UntrackedAction, Self::TrackedAction>>,
+///     ) -> Result<(), Self::Error> {
+///         // Your implementation here
+///         Ok(())
+///     }
+///
+///     async fn restore<'s, 'a>(
+///         state: &'s Self::State,
+///         actions: &'a mut Vec<Action<Self::UntrackedAction, Self::TrackedAction>>,
+/// ) -> Result<(), Self::RestoreError> {
+///         // Rebuild pending actions from state
+///         Ok(())
 ///     }
 /// }
 /// ```
 ///
-/// ## 4. Tracked Actions Must Be Stored in State
+/// # Atomicity Rules
 ///
-/// Before emitting a tracked action, store enough data in state to recreate it:
+/// The caller is responsible for wrapping STF in a transaction:
 ///
-/// ```ignore
-/// // Store in state first
-/// self.state.pending.insert(req_id, request);
-/// // Then emit action
-/// actions.add(Action::Tracked(TrackedAction::new(req_id, ...)))?;
-/// ```
+/// 1. Begin state transaction before calling STF
+/// 2. If STF returns `Ok` → commit transaction, execute actions
+/// 3. If STF returns `Err` → abort transaction, discard actions
 ///
-/// ## 5. No Side Effects in STF
+/// Within the STF:
 ///
-/// STF only mutates state and emits action *descriptions*:
+/// - **Transactional state**: All operations are part of the transaction; atomicity is automatic.
+/// - **In-memory state**: Perform fallible operations before mutations to ensure rollback safety.
 ///
-/// ```ignore
-/// // ❌ Side effect in STF
-/// send_email(&email)?;
+/// # Actions
 ///
-/// // ✅ Emit action for later execution
-/// actions.add(Action::Untracked(SendEmail { to: email }))?;
-/// ```
-///
-/// ## 6. Restore Must Be Pure Function of State
-///
-/// Restore can only read from state parameter:
-///
-/// ```ignore
-/// fn restore(state: &State, actions: &mut Actions) {
-///     // ✅ Restore from state
-///     for (id, pending) in &state.pending {
-///         if pending.needs_retry {
-///             actions.add(Action::Tracked(...));
-///         }
-///     }
-///     // ❌ Cannot query external systems
-///     // let pending = database.query_pending().await; // NO!
-/// }
-/// ```
-///
-/// # Testing
-///
-/// PHASM enables deterministic simulation testing:
-///
-/// ```ignore
-/// let mut rng = ChaCha8Rng::seed_from_u64(12345); // Deterministic!
-/// for _ in 0..10000 {
-///     let input = generate_random_input(&mut rng);
-///     state_machine.stf(state, input, actions).await?;
-///     state.check_invariants()?; // Verify after every transition
-/// }
-/// ```
-///
-/// Same seed = same test execution = reproducible bugs.
+/// Actions are collected in a `Vec` and only executed after successful commit. Since actions
+/// are discarded on error, you can emit them at any point in the STF.
 pub trait StateMachine {
-    /// Type group for Tracked Action - actions that are retryable, restorable
-    /// and whose result is given to the state machine after completion.
-    type TrackedAction: TrackedActionTypes;
-    /// Type for untracked actions - actions that are "fire and forget".
-    type UntrackedAction;
-
-    /// Type for a collection of which actions produced by a state transition
-    /// can be placed.
-    type Actions: ActionsContainer<Self::UntrackedAction, Self::TrackedAction>;
-
-    /// State/data of the state machine.
+    /// The state being managed.
+    ///
+    /// This can be an in-memory struct, a database transaction, or any mutable reference
+    /// to your application state.
     type State;
-    /// Input type for a single STF invocation
+
+    /// Normal input type (user requests, external events, etc.)
+    ///
+    /// Does not include tracked action results - those come via [`Input::TrackedActionCompleted`].
     type Input;
 
-    /// An error that can occur during STF
+    /// Tracked action types - retryable, restorable, results fed back to STF.
+    ///
+    /// See [`TrackedActionTypes`] for details.
+    type TrackedAction: TrackedActionTypes;
+
+    /// Untracked action type - fire and forget.
+    ///
+    /// Use for notifications, logging, analytics, UI updates, etc.
+    type UntrackedAction;
+
+    /// Container type for actions emitted by the STF.
+    ///
+    /// Typically `Vec<Action<Self::UntrackedAction, Self::TrackedAction>>`, but can be
+    /// a custom container that supports fallible allocation.
+    type Actions: ActionsContainer<Self::UntrackedAction, Self::TrackedAction>;
+
+    /// Error type for state transitions.
     type TransitionError;
-    /// An error that can occur during state machine restoration
+
+    /// Error type for restore operations.
     type RestoreError;
 
-    /// The future type for the State Transition Function.
-    type StfFuture<'state, 'actions>: Future<Output = Result<(), Self::TransitionError>>;
-    /// The future type for the State Machine Restoration.
-    type RestoreFuture<'state, 'actions>: Future<Output = Result<(), Self::RestoreError>>;
-
-    /// The core State Transition Function.
-    ///
-    /// # Semantics
-    ///
-    /// STF is a pure, deterministic, atomic function:
-    /// - **Input**: Current state + input
-    /// - **Output**: Updated state + actions to execute
-    /// - **Atomicity**: If returns `Err`, **state** MUST be unchanged (but actions can be modified)
-    /// - **Determinism**: Same state + input always produces same output
+    /// The core state transition function.
     ///
     /// # Parameters
     ///
-    /// - `state`: Mutable reference to current state. Modify this to reflect the transition.
-    /// - `input`: The input triggering this transition (user request or tracked action result)
-    /// - `actions`: Container to emit actions into. DO NOT read from this - it's for output only.
-    ///   The container is passed to reuse allocations across calls. **You can add actions even
-    ///   before returning an error** - the caller clears it regardless of success/failure.
+    /// - `state`: Mutable reference to current state. May be a database transaction.
+    /// - `input`: The input triggering this transition.
+    /// - `actions`: Container to emit actions into. Cleared by caller after each invocation.
     ///
     /// # Returns
     ///
-    /// - `Ok(())`: Transition successful, state updated, actions emitted
-    /// - `Err(TransitionError)`: Transition failed, **state** MUST be unchanged (actions can be modified)
+    /// - `Ok(())`: Transition successful. Caller will commit state and execute actions.
+    /// - `Err(e)`: Transition failed. Caller will abort state transaction and discard actions.
     ///
-    /// # Critical Rules
+    /// # Atomicity
     ///
-    /// 1. **Validate before mutating state**: Check all preconditions before changing **state**.
-    ///    However, you can emit actions (like error messages) before returning errors.
-    /// 2. **Store tracked actions in state**: Before emitting a tracked action, store enough
-    ///    data in state that `restore()` can recreate it
-    /// 3. **No external reads**: All external data must come through `input`. Note: reading/writing
-    ///    to a database through `state` is fine - it's external *connections* that are forbidden.
-    /// 4. **No external side effects**: Only mutate state and emit action descriptions. Don't make
-    ///    HTTP calls, don't write to external services. Database writes through `state` are fine.
+    /// If state is transactional (database), atomicity is automatic. For in-memory state,
+    /// ensure fallible operations complete before mutating state.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// async fn stf(
-    ///     state: &mut MyState,
-    ///     input: Input<MyTracked, MyInput>,
-    ///     actions: &mut Actions,
-    /// ) -> Result<(), MyError> {
+    /// async fn stf<'s, 'a>(
+    ///     state: &'s mut Self::State,
+    ///     input: Input<Self::TrackedAction, Self::Input>,
+    ///     actions: &'a mut Self::Actions,
+    /// ) -> Result<(), Self::TransitionError> {
     ///     match input {
-    ///         Input::Normal(user_request) => {
-    ///             // 1. Validate BEFORE mutating state (but can emit actions)
-    ///             if !state.can_process(&user_request) {
-    ///                 // Optional: emit error feedback action
-    ///                 actions.add(Action::Untracked(ShowError { msg: "Invalid" }))?;
+    ///         Input::Normal(request) => {
+    ///             // Validate
+    ///             if !state.can_process(&request) {
     ///                 return Err(MyError::InvalidRequest);
     ///             }
     ///
-    ///             // 2. Store in state for restore
-    ///             let req_id = state.next_id;
+    ///             // Mutate state
+    ///             let id = state.next_id;
     ///             state.next_id += 1;
-    ///             state.pending.insert(req_id, user_request.clone());
+    ///             state.pending.insert(id, request.clone());
     ///
-    ///             // 3. Emit tracked action
-    ///             actions.add(Action::Tracked(
-    ///                 TrackedAction::new(req_id, ExternalCall { ... })
-    ///             ))?;
-    ///
-    ///             // 4. Emit untracked actions
-    ///             actions.add(Action::Untracked(
-    ///                 SendNotification { user: user_request.user }
-    ///             ))?;
+    ///             // Emit tracked action
+    ///             actions.add(Action::Tracked(TrackedAction::new(id, request)))?;
     ///
     ///             Ok(())
     ///         }
-    ///         Input::TrackedActionCompleted { id, res } => {
-    ///             // Update state based on action result
-    ///             let pending = state.pending.get_mut(&id)
-    ///                 .ok_or(MyError::UnknownRequest)?;
-    ///             pending.status = match res {
-    ///                 Success => Status::Completed,
-    ///                 Failed => Status::Failed,
-    ///             };
+    ///         Input::TrackedActionCompleted { id, result } => {
+    ///             // Handle completion
+    ///             state.pending.remove(&id);
     ///             Ok(())
     ///         }
     ///     }
@@ -289,46 +372,32 @@ pub trait StateMachine {
         state: &'state mut Self::State,
         input: Input<Self::TrackedAction, Self::Input>,
         actions: &'actions mut Self::Actions,
-    ) -> Self::StfFuture<'state, 'actions>;
+    ) -> impl Future<Output = Result<(), Self::TransitionError>> + use<'state, 'actions, Self>;
 
-    /// Restore tracked actions from state after crash/restart.
+    /// Restore pending tracked actions from state after crash/restart.
     ///
-    /// # Purpose
-    ///
-    /// After a system crash, `restore()` rebuilds the list of pending tracked actions
-    /// that need to be retried or checked for completion.
-    /// **Rule**: Restore can ONLY read from the `state` parameter.
-    ///
-    /// # Semantics
-    ///
-    /// - **Input**: Current state (after loading from disk/database or from transaction)
-    /// - **Output**: Actions that should be re-executed or status-checked
-    /// - **Purity**: Must be a pure function of `state` - no external reads beyond `state`
+    /// After a crash, the runtime calls `restore()` to rebuild the list of pending
+    /// tracked actions that need to be retried or status-checked.
     ///
     /// # Parameters
     ///
-    /// - `state`: The restored state (loaded from persistent storage)
-    /// - `actions`: Container to emit restored actions into
+    /// - `state`: The restored state (loaded from persistent storage or transaction).
+    /// - `actions`: Container to emit restored actions into.
     ///
-    /// # Critical Rules
+    /// # Rules
     ///
-    /// 1. **Only use state**: Cannot open new database connections or query external APIs.
-    ///    Reading from a database through `state` is fine - it's opening new connections that's forbidden.
-    /// 2. **Must be deterministic**: Same state always produces same actions
-    /// 3. **Clear before use**: The actions container should be cleared before adding
+    /// 1. **Pure function of state**: Cannot make external queries or open connections.
+    /// 2. **Deterministic**: Same state always produces the same actions.
+    /// 3. **Actions pre-cleared**: The runtime clears the actions container before calling restore.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// async fn restore(
-    ///     state: &MyState,
-    ///     actions: &mut Actions,
-    /// ) -> Result<(), RestoreError> {
-    ///     // Clear container to reuse allocation
-    ///     actions.clear()?;
-    ///
-    ///     // Restore all pending tracked actions from state
-    ///     for (id, pending) in &state.pending_operations {
+    /// async fn restore<'s, 'a>(
+    ///     state: &'s Self::State,
+    ///     actions: &'a mut Self::Actions,
+    /// ) -> Result<(), Self::RestoreError> {
+    ///     for (&id, pending) in &state.pending_operations {
     ///         match pending.status {
     ///             Status::AwaitingResponse => {
     ///                 // Re-check status with external system
@@ -337,9 +406,9 @@ pub trait StateMachine {
     ///                 ))?;
     ///             }
     ///             Status::NeedsRetry => {
-    ///                 // Retry the original operation
+    ///                 // Retry the operation
     ///                 actions.add(Action::Tracked(
-    ///                     TrackedAction::new(id, pending.original_action.clone())
+    ///                     TrackedAction::new(id, pending.original_request.clone())
     ///                 ))?;
     ///             }
     ///             Status::Completed => {
@@ -351,27 +420,8 @@ pub trait StateMachine {
     ///     Ok(())
     /// }
     /// ```
-    ///
-    /// # Testing Restore
-    ///
-    /// Verify restore correctness:
-    ///
-    /// ```ignore
-    /// // Create state with pending operations
-    /// let mut state = MyState {
-    ///     pending: hashmap! { 1 => PendingOp { ... } },
-    ///     ...
-    /// };
-    ///
-    /// // Restore should recreate the tracked actions
-    /// let mut actions = vec![];
-    /// MyStateMachine::restore(&state, &mut actions).await?;
-    ///
-    /// assert_eq!(actions.len(), 1);
-    /// assert!(matches!(actions[0], Action::Tracked(_)));
-    /// ```
     fn restore<'state, 'actions>(
         state: &'state Self::State,
         actions: &'actions mut Self::Actions,
-    ) -> Self::RestoreFuture<'state, 'actions>;
+    ) -> impl Future<Output = Result<(), Self::RestoreError>> + use<'state, 'actions, Self>;
 }
