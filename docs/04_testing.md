@@ -172,7 +172,7 @@ async fn test_crash_recovery() {
                     BookingSystem::stf(
                         &mut state,
                         Input::TrackedActionCompleted { 
-                            id: tracked.action_id, 
+                            id: tracked.id().clone(), 
                             result, 
                         },
                         &mut actions,

@@ -402,7 +402,7 @@ async fn restore(state: &DbState<'_>, actions: &mut Actions) -> Result<()> {
     .await?;
     
     for p in pending {
-        actions.add(TrackedAction::new(p.id, deserialize_op(p.operation)))?;
+        actions.add(Action::Tracked(TrackedAction::new(p.id, deserialize_op(p.operation))))?;
     }
     
     Ok(())

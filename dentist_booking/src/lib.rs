@@ -251,19 +251,31 @@ pub enum BookingError {
 
 pub type ReqId = u64;
 
+/// Actions sent to the external payment processor.
+///
+/// - `Preauth`: Hold funds on user's payment method (emitted during normal booking flow)
+/// - `Release`: Cancel a preauthorization hold (emitted when slot is taken by another user)
+/// - `CheckStatus`: Query status of a pending preauth (emitted during restore)
+///
+/// The runtime/executor handles these by calling the payment processor API and
+/// feeding the result back as `PaymentResult`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PaymentReq {
+    /// Request to preauthorize payment. Sent during normal booking flow.
     Preauth {
         user_id: u64,
         amount_cents: u32,
         req_id: ReqId,
     },
-    Release {
-        req_id: ReqId,
-    },
-    CheckStatus {
-        req_id: ReqId,
-    },
+    /// Release a preauthorization hold. Sent when the slot was taken by another user
+    /// after our preauth succeeded (race condition handling).
+    Release { req_id: ReqId },
+    /// Query status of a pending preauthorization. Sent during restore to handle
+    /// the case where we crashed after sending Preauth but before getting a response.
+    ///
+    /// We use CheckStatus (not Preauth) because payment processors are NOT idempotent:
+    /// re-sending Preauth could create a second hold on the user's card!
+    CheckStatus { req_id: ReqId },
 }
 
 #[derive(Debug)]
@@ -336,6 +348,9 @@ impl StateMachine for BookingSystem {
                     handle_payment_success(state, actions, id, amount)
                 }
                 PaymentResult::Failed { reason } => handle_payment_failed(state, id, reason),
+                // Released: preauth was cancelled, nothing to do
+                // Pending: payment processor still processing - in production, the runtime
+                // should schedule another CheckStatus with exponential backoff
                 PaymentResult::Released | PaymentResult::Pending => Ok(()),
             },
         }
@@ -345,6 +360,17 @@ impl StateMachine for BookingSystem {
         state: &Self::State,
         actions: &mut Self::Actions,
     ) -> Result<(), Self::RestoreError> {
+        // After a crash, we have pending requests in state but don't know if
+        // the payment processor completed the preauthorization.
+        //
+        // We use CheckStatus (NOT Preauth) because payment processors are non-idempotent:
+        // - If we re-emit Preauth, we might create a SECOND hold on the user's card
+        // - CheckStatus asks the processor "did request X succeed?" without side effects
+        //
+        // For idempotent external systems, you could re-emit the original action instead.
+        //
+        // Note: If CheckStatus returns Pending, the runtime should retry later
+        // (not shown in this example - would need exponential backoff or job queue).
         for (&id, pending) in &state.pending {
             if pending.status == ReqStatus::AwaitingPreauth {
                 actions
