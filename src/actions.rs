@@ -70,6 +70,11 @@ impl<Types: TrackedActionTypes> TrackedAction<Types> {
     pub fn action(&self) -> &Types::Action {
         &self.action
     }
+
+    /// Consume the tracked action, returning the ID and action payload.
+    pub fn into_parts(self) -> (Types::Id, Types::Action) {
+        (self.action_id, self.action)
+    }
 }
 
 /// An action emitted by the state transition function.
@@ -91,6 +96,22 @@ pub enum Action<UA, TATypes: TrackedActionTypes> {
 
     /// An untracked fire-and-forget action.
     Untracked(UA),
+}
+
+impl<UA, TATypes: TrackedActionTypes> Action<UA, TATypes> {
+    /// Create a new tracked action.
+    ///
+    /// Convenience for `Action::Tracked(TrackedAction::new(id, action))`.
+    pub fn new_tracked(id: TATypes::Id, action: TATypes::Action) -> Self {
+        Self::Tracked(TrackedAction::new(id, action))
+    }
+
+    /// Create a new untracked action.
+    ///
+    /// Convenience for `Action::Untracked(action)`.
+    pub fn new_untracked(action: UA) -> Self {
+        Self::Untracked(action)
+    }
 }
 
 /// A trait for describing a fallible container for a set of [`Action`]s.
