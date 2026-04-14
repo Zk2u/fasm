@@ -9,5 +9,5 @@ ahash = "0.8"
 
 [dev-dependencies]
 monoio = { version = "0.2", features = ["macros"] }
-rand = "0.8"
+rand = "0.9"
 rand_chacha = "0.3"
