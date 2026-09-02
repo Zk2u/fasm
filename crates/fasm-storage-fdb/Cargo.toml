@@ -1,0 +1,30 @@
+[package]
+name = "fasm-storage-fdb"
+version = "0.1.0"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "FoundationDB backend for the fasm-storage KvStore: transactional KV over a live FDB cluster"
+
+[features]
+# Enables the conformance suite, which requires a live FoundationDB cluster and
+# libfdb_c to link the test binary. Off by default so the crate's compile gate
+# (check / clippy) runs without a cluster; CI turns it on.
+fdb-storage-tests = []
+
+[dependencies]
+fasm-storage.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+# `embedded-fdb-include` embeds the FDB C headers so the crate compiles without a
+# system FDB install; `fdb-7_3` pins the FDB API version. Both match the pin the
+# codebase this port came from uses.
+foundationdb = { workspace = true, features = ["embedded-fdb-include", "fdb-7_3"] }
+
+[dev-dependencies]
+# The FDB conformance futures await real network I/O, so a real executor is
+# needed. Tests are gated behind `fdb-storage-tests` and run in CI against a live
+# cluster (with libfdb_c to link).
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+fasm-storage = { workspace = true, features = ["test-utils"] }
