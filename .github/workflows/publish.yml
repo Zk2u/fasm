@@ -1,0 +1,151 @@
+name: Publish
+
+# Tag-triggered publish of one workspace crate to crates.io.
+#
+# Tag scheme: <crate>-v<version>, e.g. fasm-storage-v0.1.0. One tag
+# publishes exactly one crate. The verify job requires the tag's
+# version to equal the crate's manifest version.
+#
+# Tag fasm-storage before the backend crates: publishing rewrites
+# their path dependency on it to a version dependency, so consumers
+# of a backend crate need fasm-storage on crates.io first.
+#
+# Requires the CRATES_TOKEN repository secret: a crates.io API token
+# with publish scope for the crate being tagged.
+
+on:
+  push:
+    tags:
+      - '*-v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  verify-version:
+    name: Verify tag and manifest version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Parse crate and version from tag
+        id: tag
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          # <crate>-v<version>: the crate is everything before the
+          # last -v, the version is everything after it.
+          echo "crate=${TAG%-v*}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG##*-v}" >> "$GITHUB_OUTPUT"
+      - name: Verify the crate exists and its manifest version matches
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          CRATE="${TAG%-v*}"
+          WANTED="${TAG##*-v}"
+          ACTUAL=$(cargo metadata --no-deps --format-version 1 |
+            jq -r --arg name "$CRATE" '.packages[] | select(.name == $name) | .version')
+          if [ -z "$ACTUAL" ] || [ "$ACTUAL" = "null" ]; then
+            echo "No workspace package named '$CRATE'."
+            exit 1
+          fi
+          if [ "$ACTUAL" != "$WANTED" ]; then
+            echo "Tag version ($WANTED) does not match manifest version ($ACTUAL)."
+            exit 1
+          fi
+          echo "Versions match: $ACTUAL"
+
+  test:
+    name: Test Suite (FDB 7.3 live cluster)
+    runs-on: ubuntu-latest
+    needs: verify-version
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.toml') }}
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.toml') }}
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.toml') }}
+      - name: Setup FoundationDB
+        uses: foundationdb-rs/foundationdb-actions-install@v2.3.0
+        with:
+          version: "7.3.79"
+      - name: Configure cluster
+        run: fdbcli --exec "configure single memory tenant_mode=optional_experimental"
+      - name: Workspace tests
+        run: cargo test --workspace
+      - name: FDB backend tests
+        run: cargo test -p fasm-storage-fdb --features fdb-storage-tests
+
+  doc:
+    name: Documentation
+    runs-on: ubuntu-latest
+    needs: verify-version
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build docs for the storage crates
+        run: >
+          cargo doc --no-deps
+          -p fasm-storage -p fasm-storage-btreemap -p fasm-storage-redb -p fasm-storage-fdb
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  publish-dry-run:
+    name: Publish (dry run)
+    runs-on: ubuntu-latest
+    needs: [test, doc]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Dry run publish
+        env:
+          CRATE: ${{ needs.verify-version.outputs.crate }}
+        run: cargo publish --dry-run -p "$CRATE"
+
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: publish-dry-run
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Publish
+        env:
+          CRATE: ${{ needs.verify-version.outputs.crate }}
+          CRATES_TOKEN: ${{ secrets.CRATES_TOKEN }}
+        run: cargo publish -p "$CRATE" --token "$CRATES_TOKEN"
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: publish
+    steps:
+      - name: Create the release at the publish tag
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
