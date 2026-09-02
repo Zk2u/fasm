@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    name: fmt + clippy (storage crates)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: >
+          cargo clippy
+          -p fasm-storage -p fasm-storage-btreemap -p fasm-storage-redb -p fasm-storage-fdb
+          --all-targets -- -D warnings
+      - name: clippy (FDB test suite)
+        run: >
+          cargo clippy
+          -p fasm-storage-fdb --all-targets --features fdb-storage-tests
+          -- -D warnings
+
+  test:
+    name: tests (FDB 7.3 live cluster)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Setup FoundationDB
+        uses: foundationdb-rs/foundationdb-actions-install@v2.3.0
+        with:
+          version: "7.3.79"
+      - name: Configure cluster
+        run: fdbcli --exec "configure single memory tenant_mode=optional_experimental"
+      - name: Workspace tests
+        run: cargo test --workspace
+      - name: FDB backend tests
+        run: cargo test -p fasm-storage-fdb --features fdb-storage-tests
