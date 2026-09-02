@@ -1,0 +1,21 @@
+[package]
+name = "fasm-storage-btreemap"
+version = "0.1.0"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "In-memory BTreeMap backend for the fasm-storage KvStore; for tests and simulations only (no crash atomicity, commit is a no-op)"
+
+[dependencies]
+fasm-storage.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# The conformance macro lives in fasm-storage behind its `test-utils` feature;
+# a dependency is built in normal (non-`test`) mode, so the feature must be
+# named here to make `fasm_storage::kv_store_tests!` available in this crate's
+# test build.
+fasm-storage = { workspace = true, features = ["test-utils"] }
+proptest.workspace = true
