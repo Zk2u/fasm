@@ -1,0 +1,24 @@
+[package]
+name = "fasm-storage-redb"
+version = "0.1.0"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "redb backend for the fasm-storage KvStore: a transactional file-backed store with a dedicated commit thread"
+
+[dependencies]
+fasm-storage.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+redb.workspace = true
+# tokio: commit is handed to a dedicated std::thread over an unbounded mpsc
+# channel; the non-parking open waits on the dedicated open thread over a
+# oneshot. `rt` is used by the test executor to drive those cross-thread awaits.
+tokio = { workspace = true, features = ["rt"] }
+tracing.workspace = true
+
+[dev-dependencies]
+# `macros` + `time` back #[tokio::test] and the non-parking-open suspension test.
+tokio = { workspace = true, features = ["macros", "time"] }
+fasm-storage = { workspace = true, features = ["test-utils"] }
