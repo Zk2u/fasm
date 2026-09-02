@@ -14,4 +14,30 @@ monoio = "0.2.4"
 
 [workspace]
 resolver = "3"
-members = ["dentist_booking"]
+members = [
+    "dentist_booking",
+    "crates/fasm-storage",
+    "crates/fasm-storage-btreemap",
+    "crates/fasm-storage-redb",
+    "crates/fasm-storage-fdb",
+]
+
+[workspace.package]
+edition = "2024"
+repository = "https://github.com/zk2u/fasm"
+license = "MIT OR Apache-2.0"
+publish = true
+
+[workspace.dependencies]
+fasm-storage = { path = "crates/fasm-storage" }
+fasm-storage-btreemap = { path = "crates/fasm-storage-btreemap" }
+fasm-storage-redb = { path = "crates/fasm-storage-redb" }
+fasm-storage-fdb = { path = "crates/fasm-storage-fdb" }
+
+async-trait = "0.1"
+thiserror = "2"
+proptest = "1.11"
+redb = "2"
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
+foundationdb = { git = "https://github.com/foundationdb-rs/foundationdb-rs.git", rev = "ed274ba533e15ec02e4ab8dd4defca7d18eaf355" }
