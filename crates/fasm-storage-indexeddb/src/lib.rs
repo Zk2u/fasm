@@ -52,6 +52,9 @@
 //! `wasm32-unknown-unknown` predicate.
 
 mod error;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[allow(dead_code, unused_imports)]
+mod idb;
 // The browser I/O layer arrives in later commits. Keep its pure, crate-local
 // dependency compiled on every target in the meantime.
 #[allow(dead_code)]
