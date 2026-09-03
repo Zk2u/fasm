@@ -25,6 +25,12 @@
 //! session may observe a mixed view, but such a session can never commit after
 //! another writer moves the fence.
 //!
+//! Empty sessions still validate that fence, but write nothing and do not
+//! advance the revision. Non-empty commits request strict durability. Chrome
+//! honours that hint; other browsers may ignore it and use their default
+//! durability. A successful commit therefore means the transaction committed
+//! and, where the browser honours the hint, was flushed durably.
+//!
 //! Once commit starts, dropping its Rust future does not cancel the IndexedDB
 //! transaction. The browser operation continues detached because abandoning
 //! the future cannot synchronously roll back work already submitted to
@@ -66,11 +72,16 @@
 //! implementation. [`IndexedDbStore`] and all browser API code stay behind the
 //! exact `wasm32-unknown-unknown` predicate.
 
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+mod commit;
 mod error;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod flat;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod idb;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+mod operation;
+#[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) mod overlay;
 mod revision;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -89,6 +100,8 @@ pub use session::{IndexedDbReader, IndexedDbTransaction};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub use store::IndexedDbStore;
 
+#[cfg(all(test, all(target_arch = "wasm32", target_os = "unknown")))]
+mod commit_tests;
 #[cfg(all(test, all(target_arch = "wasm32", target_os = "unknown")))]
 mod conformance_tests;
 #[cfg(all(test, all(target_arch = "wasm32", target_os = "unknown")))]

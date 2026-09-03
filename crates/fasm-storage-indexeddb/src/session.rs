@@ -23,9 +23,21 @@ use crate::{
 /// buffer remains private to this session until the later commit operation
 /// applies it atomically after checking [`expected_revision`](Self::expected_revision).
 pub struct IndexedDbTransaction {
-    store: IndexedDbStore,
-    buffer: WriteBuffer,
-    expected: Revision,
+    pub(crate) store: IndexedDbStore,
+    pub(crate) buffer: WriteBuffer,
+    pub(crate) expected: Revision,
+    #[cfg(test)]
+    pub(crate) faults: FaultInjection,
+}
+
+/// Test-only failures injected at distinct commit phases.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct FaultInjection {
+    pub fail_conversion_of: Option<Vec<u8>>,
+    pub fail_enqueue_of: Option<Vec<u8>>,
+    pub fail_request_of: Option<Vec<u8>>,
+    pub fail_abort: bool,
 }
 
 impl fmt::Debug for IndexedDbTransaction {
@@ -44,7 +56,15 @@ impl IndexedDbTransaction {
             store,
             buffer: WriteBuffer::new(),
             expected,
+            #[cfg(test)]
+            faults: FaultInjection::default(),
         }
+    }
+
+    /// Installs deterministic commit failures for browser tests.
+    #[cfg(test)]
+    pub(crate) fn inject_faults(&mut self, faults: FaultInjection) {
+        self.faults = faults;
     }
 
     /// Returns the number of keys with a pending value or tombstone.

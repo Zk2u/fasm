@@ -9,6 +9,10 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
+use fasm_storage::KvStore;
+use fasm_storage::flatdir::{
+    COUNTER_KEY, LAYOUT_VERSION, ROOT_PREFIX, ROOT_PREFIX_KEY, VERSION_KEY, encode_varint,
+};
 use js_sys::Reflect;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_test::wasm_bindgen_test;
@@ -18,10 +22,10 @@ use crate::{
     IndexedDbError, IndexedDbStore, Revision,
     idb::{
         KV_STORE, META_STORE, REVISION_KEY, RequestFuture, TransactionOutcome, bytes_to_js,
-        dom_error, fixture::await_complete, fixture::sleep_ms, fixture::unique_name,
-        fixture::wait_until, global_factory, revision_from_js,
+        dom_error, fixture::await_complete, fixture::seed_root_rows, fixture::sleep_ms,
+        fixture::unique_name, fixture::wait_until, global_factory, revision_from_js,
     },
-    store::Scope,
+    store::{Scope, transaction_durability},
 };
 
 fn from_js<T>(result: Result<T, JsValue>) -> Result<T, IndexedDbError> {
@@ -49,11 +53,7 @@ async fn raw_open(
 }
 
 async fn put_raw_row(store: &IndexedDbStore) -> Result<(), IndexedDbError> {
-    let transaction = store.begin(IdbTransactionMode::Readwrite, Scope::Kv)?;
-    let outcome = TransactionOutcome::new(transaction.clone());
-    let object_store = from_js(transaction.object_store(KV_STORE))?;
-    from_js(object_store.put_with_key(&bytes_to_js(b"value"), &bytes_to_js(b"key")))?;
-    await_complete(outcome).await
+    seed_root_rows(store, &[(b"key", b"value")]).await
 }
 
 async fn kv_count(store: &IndexedDbStore) -> Result<u32, IndexedDbError> {
@@ -91,6 +91,13 @@ fn object_store_names(database: &IdbDatabase) -> Result<Vec<String>, IndexedDbEr
         .collect()
 }
 
+fn browser_user_agent() -> Option<String> {
+    let navigator = Reflect::get(&js_sys::global(), &JsValue::from_str("navigator")).ok()?;
+    Reflect::get(&navigator, &JsValue::from_str("userAgent"))
+        .ok()?
+        .as_string()
+}
+
 #[wasm_bindgen_test]
 async fn open_twice_creates_schema_and_initial_revision() -> Result<(), IndexedDbError> {
     let name = unique_name("open-schema");
@@ -125,7 +132,7 @@ async fn delete_removes_rows_and_recreates_revision() -> Result<(), IndexedDbErr
     let name = unique_name("delete-removes");
     let store = IndexedDbStore::open(&name).await?;
     put_raw_row(&store).await?;
-    assert_eq!(kv_count(&store).await?, 1);
+    assert_eq!(kv_count(&store).await?, 4);
     drop(store);
 
     IndexedDbStore::delete(&name).await?;
@@ -141,6 +148,44 @@ async fn delete_removes_rows_and_recreates_revision() -> Result<(), IndexedDbErr
     assert_eq!(revision_from_js(&revision)?, Revision::ZERO);
 
     drop(reopened);
+    IndexedDbStore::delete(&name).await
+}
+
+#[wasm_bindgen_test]
+async fn durable_transaction_requests_strict_and_completes_write() -> Result<(), IndexedDbError> {
+    let name = unique_name("strict-durability");
+    let store = IndexedDbStore::open(&name).await?;
+    let transaction = store.begin_durable(Scope::KvAndMeta)?;
+    let durability = transaction_durability(&transaction);
+    if browser_user_agent().is_some_and(|agent| agent.contains("Chrome/")) {
+        assert_eq!(durability.as_deref(), Some("strict"));
+    } else {
+        assert!(matches!(
+            durability.as_deref(),
+            None | Some("default") | Some("strict")
+        ));
+    }
+
+    let outcome = TransactionOutcome::new(transaction.clone());
+    let object_store = from_js(transaction.object_store(KV_STORE))?;
+    let counter = encode_varint(1);
+    let mut raw_key = ROOT_PREFIX.to_vec();
+    raw_key.extend_from_slice(b"key");
+    for (key, value) in [
+        (VERSION_KEY, LAYOUT_VERSION),
+        (ROOT_PREFIX_KEY, ROOT_PREFIX),
+        (COUNTER_KEY, counter.as_slice()),
+        (raw_key.as_slice(), b"value".as_slice()),
+    ] {
+        from_js(object_store.put_with_key(&bytes_to_js(value), &bytes_to_js(key)))?;
+    }
+    await_complete(outcome).await?;
+    assert_eq!(
+        store.reader().get(&[], b"key").await?,
+        Some(b"value".to_vec())
+    );
+
+    drop(store);
     IndexedDbStore::delete(&name).await
 }
 

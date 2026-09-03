@@ -3,13 +3,10 @@
 use std::{
     cell::{Cell, RefCell},
     fmt,
-    future::Future,
-    pin::Pin,
     rc::{Rc, Weak},
-    task::{Context, Poll, Waker},
 };
 
-use js_sys::Array;
+use js_sys::{Array, Function, Object, Reflect};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use web_sys::{
     Event, IdbDatabase, IdbFactory, IdbOpenDbRequest, IdbRequest, IdbTransaction,
@@ -23,6 +20,7 @@ use crate::{
         TransactionEnd, TransactionOutcome, detach, dom_error, global_factory,
         log_detached_failure, release, revision_from_js, revision_to_js,
     },
+    operation::{OperationReceiver, OperationSender},
 };
 
 type EventHandler = RefCell<Option<Closure<dyn FnMut(Event)>>>;
@@ -158,18 +156,61 @@ impl IndexedDbStore {
             }
         };
 
-        transaction.map_err(|value| {
-            let error = dom_error(&value);
-            if matches!(
-                &error,
-                IndexedDbError::Backend { name, .. } if name == "InvalidStateError"
-            ) {
-                self.inner.closed.set(true);
-                IndexedDbError::Closed
-            } else {
-                error
+        transaction.map_err(|value| self.begin_error(&value))
+    }
+
+    /// Starts a readwrite transaction that requests strict browser durability.
+    ///
+    /// The options overload is called reflectively because web-sys exposes it
+    /// only under `web_sys_unstable_apis`. Browsers that do not implement the
+    /// hint may ignore it and create a transaction with their default
+    /// durability instead.
+    pub(crate) fn begin_durable(&self, scope: Scope) -> Result<IdbTransaction, IndexedDbError> {
+        let database = self.database()?;
+        let store_names = match scope {
+            Scope::Kv => JsValue::from_str(KV_STORE),
+            Scope::Meta => JsValue::from_str(META_STORE),
+            Scope::KvAndMeta => {
+                let stores = Array::new();
+                stores.push(&JsValue::from_str(KV_STORE));
+                stores.push(&JsValue::from_str(META_STORE));
+                stores.into()
             }
-        })
+        };
+        let options = Object::new();
+        Reflect::set(
+            options.as_ref(),
+            &JsValue::from_str("durability"),
+            &JsValue::from_str("strict"),
+        )
+        .map_err(|value| self.begin_error(&value))?;
+        let transaction = Reflect::get(database.as_ref(), &JsValue::from_str("transaction"))
+            .map_err(|value| self.begin_error(&value))?
+            .dyn_into::<Function>()
+            .map_err(|value| self.begin_error(&value))?;
+        transaction
+            .call3(
+                database.as_ref(),
+                &store_names,
+                &JsValue::from_str("readwrite"),
+                options.as_ref(),
+            )
+            .map_err(|value| self.begin_error(&value))?
+            .dyn_into::<IdbTransaction>()
+            .map_err(|value| self.begin_error(&value))
+    }
+
+    fn begin_error(&self, value: &JsValue) -> IndexedDbError {
+        let error = dom_error(value);
+        if matches!(
+            &error,
+            IndexedDbError::Backend { name, .. } if name == "InvalidStateError"
+        ) {
+            self.inner.closed.set(true);
+            IndexedDbError::Closed
+        } else {
+            error
+        }
     }
 }
 
@@ -180,8 +221,15 @@ pub(crate) enum Scope {
     /// The revision metadata object store.
     Meta,
     /// The application and revision metadata object stores.
-    #[allow(dead_code)] // used from commit 8 (commit)
     KvAndMeta,
+}
+
+/// Returns the browser-reported durability mode when that property is exposed.
+#[cfg(test)]
+pub(crate) fn transaction_durability(transaction: &IdbTransaction) -> Option<String> {
+    Reflect::get(transaction.as_ref(), &JsValue::from_str("durability"))
+        .ok()?
+        .as_string()
 }
 
 pub(crate) fn readonly_result(outcome: TransactionEnd) -> Result<(), IndexedDbError> {
@@ -251,68 +299,10 @@ impl Drop for Connection {
     }
 }
 
-struct ReceiverState<T> {
-    outcome: Option<T>,
-    waker: Option<Waker>,
-}
-
-impl<T> ReceiverState<T> {
-    fn pending() -> Self {
-        Self {
-            outcome: None,
-            waker: None,
-        }
-    }
-}
-
-struct OperationReceiver<T> {
-    state: Rc<RefCell<ReceiverState<T>>>,
-}
-
-impl<T> Future for OperationReceiver<T> {
-    type Output = T;
-
-    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.state.try_borrow_mut() {
-            Ok(mut state) => match state.outcome.take() {
-                Some(outcome) => Poll::Ready(outcome),
-                None => {
-                    state.waker = Some(context.waker().clone());
-                    Poll::Pending
-                }
-            },
-            Err(_) => {
-                log_callback_conflict("receiver poll");
-                Poll::Pending
-            }
-        }
-    }
-}
-
-fn settle_receiver<T>(receiver: &Weak<RefCell<ReceiverState<T>>>, outcome: T) -> bool {
-    let Some(receiver) = receiver.upgrade() else {
-        return false;
-    };
-    let waker = match receiver.try_borrow_mut() {
-        Ok(mut state) => {
-            state.outcome = Some(outcome);
-            state.waker.take()
-        }
-        Err(_) => {
-            log_callback_conflict("receiver settlement");
-            return true;
-        }
-    };
-    if let Some(waker) = waker {
-        waker.wake();
-    }
-    true
-}
-
 struct OpenOperation {
     request: IdbOpenDbRequest,
     name: String,
-    receiver: Weak<RefCell<ReceiverState<Result<IndexedDbStore, IndexedDbError>>>>,
+    receiver: OperationSender<Result<IndexedDbStore, IndexedDbError>>,
     anchor: Cell<Option<DetachedId>>,
     upgrade_error: RefCell<Option<IndexedDbError>>,
     blocked_warned: Cell<bool>,
@@ -327,11 +317,11 @@ impl OpenOperation {
         request: IdbOpenDbRequest,
         name: String,
     ) -> OperationReceiver<Result<IndexedDbStore, IndexedDbError>> {
-        let receiver = Rc::new(RefCell::new(ReceiverState::pending()));
+        let (receiver, sender) = OperationReceiver::new();
         let operation = Rc::new(Self {
             request,
             name,
-            receiver: Rc::downgrade(&receiver),
+            receiver: sender,
             anchor: Cell::new(None),
             upgrade_error: RefCell::new(None),
             blocked_warned: Cell::new(false),
@@ -342,7 +332,7 @@ impl OpenOperation {
         });
         operation.install_handlers();
         operation.anchor.set(Some(detach(Rc::clone(&operation))));
-        OperationReceiver { state: receiver }
+        receiver
     }
 
     fn install_handlers(self: &Rc<Self>) {
@@ -472,13 +462,13 @@ impl OpenOperation {
             }
             (Some(error), Err(_)) | (None, Err(error)) => self.deliver_error(error),
             (None, Ok(database)) => {
-                if self.receiver.upgrade().is_none() {
+                if !self.receiver.is_attached() {
                     database.close();
                 } else {
                     let store = IndexedDbStore {
                         inner: Connection::new(self.name.clone(), database),
                     };
-                    settle_receiver(&self.receiver, Ok(store));
+                    self.receiver.settle(Ok(store));
                 }
             }
         }
@@ -502,8 +492,8 @@ impl OpenOperation {
     }
 
     fn deliver_error(&self, error: IndexedDbError) {
-        if self.receiver.upgrade().is_some() {
-            settle_receiver(&self.receiver, Err(error));
+        if self.receiver.is_attached() {
+            self.receiver.settle(Err(error));
         } else {
             log_detached_failure("open", &error);
         }
@@ -533,7 +523,7 @@ impl OpenOperation {
 struct DeleteOperation {
     request: IdbOpenDbRequest,
     name: String,
-    receiver: Weak<RefCell<ReceiverState<Result<(), IndexedDbError>>>>,
+    receiver: OperationSender<Result<(), IndexedDbError>>,
     anchor: Cell<Option<DetachedId>>,
     blocked_warned: Cell<bool>,
     blocked: EventHandler,
@@ -546,11 +536,11 @@ impl DeleteOperation {
         request: IdbOpenDbRequest,
         name: String,
     ) -> OperationReceiver<Result<(), IndexedDbError>> {
-        let receiver = Rc::new(RefCell::new(ReceiverState::pending()));
+        let (receiver, sender) = OperationReceiver::new();
         let operation = Rc::new(Self {
             request,
             name,
-            receiver: Rc::downgrade(&receiver),
+            receiver: sender,
             anchor: Cell::new(None),
             blocked_warned: Cell::new(false),
             blocked: RefCell::new(None),
@@ -559,7 +549,7 @@ impl DeleteOperation {
         });
         operation.install_handlers();
         operation.anchor.set(Some(detach(Rc::clone(&operation))));
-        OperationReceiver { state: receiver }
+        receiver
     }
 
     fn install_handlers(self: &Rc<Self>) {
@@ -602,14 +592,14 @@ impl DeleteOperation {
     }
 
     fn delete_succeeded(&self) {
-        settle_receiver(&self.receiver, Ok(()));
+        self.receiver.settle(Ok(()));
         self.finish();
     }
 
     fn delete_failed(&self) {
         let error = request_error(&self.request);
-        if self.receiver.upgrade().is_some() {
-            settle_receiver(&self.receiver, Err(error));
+        if self.receiver.is_attached() {
+            self.receiver.settle(Err(error));
         } else {
             log_detached_failure("delete", &error);
         }
