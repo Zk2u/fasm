@@ -11,9 +11,13 @@
 //! and ignored because unwinding through a wasm callback would trap JavaScript
 //! and could let an active transaction auto-commit in a partially driven state.
 
+mod convert;
 mod detached;
 mod request;
 
+pub(crate) use convert::{
+    KeyRange, bytes_from_js, bytes_to_js, key_range, revision_from_js, revision_to_js,
+};
 pub(crate) use detached::{DetachedId, detach, log_detached_failure, release};
 pub(crate) use request::{
     CursorPage, RequestFuture, TransactionEnd, TransactionOutcome, dom_error, factory_from,
@@ -22,6 +26,12 @@ pub(crate) use request::{
 
 /// Maximum number of committed rows driven by one cursor callback chain.
 pub(crate) const PAGE_SIZE: usize = 256;
+
+#[cfg(test)]
+pub(crate) mod fixture;
+
+#[cfg(test)]
+mod convert_tests;
 
 #[cfg(test)]
 mod tests;
