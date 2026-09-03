@@ -1,4 +1,3 @@
-
 //! Ordered async byte-oriented key-value storage.
 //!
 //! This is the lowest storage layer for FASM state machines: an ordered map

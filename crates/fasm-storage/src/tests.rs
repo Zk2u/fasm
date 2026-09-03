@@ -12,10 +12,10 @@
 use core::error::Error;
 use core::fmt;
 use core::future::Future;
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use core::ops::Bound;
 use core::pin::pin;
 use core::task::{Context, Poll, Waker};
+use std::collections::{BTreeMap, VecDeque};
 
 // `proptest` reaches `wait-timeout`, which does not support browser wasm.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -25,12 +25,16 @@ use proptest::prelude::*;
 use crate::commit::Commit;
 use crate::error::RetryableStorageError;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use crate::flatengine::FlatEngine;
+use crate::flatengine::FlatError;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use crate::maybe_send::MaybeSend;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use crate::nav::KvDirNav;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use crate::store::KvStore;
 use crate::stream::KvStream;
+use crate::{KvPair, RawKv};
 
 // =========================================================================
 // Test support, local to this crate.
@@ -114,6 +118,161 @@ impl RetryableStorageError for TestErr {
     fn is_retryable(&self) -> bool {
         false
     }
+}
+
+/// A synchronous ordered raw map used to exercise [`FlatEngine`] without
+/// depending on one of the backend crates (which would create a dependency
+/// cycle in this crate's test build).
+#[derive(Default)]
+struct MapRaw(BTreeMap<Vec<u8>, Vec<u8>>);
+
+impl RawKv for MapRaw {
+    type Error = TestErr;
+
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(self.0.get(key).cloned())
+    }
+
+    fn scan(
+        &self,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+        forward: bool,
+    ) -> Result<Vec<KvPair>, Self::Error> {
+        let mut pairs: Vec<KvPair> = self
+            .0
+            .iter()
+            .filter(|(key, _)| raw_bounds_contain(&start, &end, key))
+            .map(|(key, value)| KvPair {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect();
+        if !forward {
+            pairs.reverse();
+        }
+        Ok(pairs)
+    }
+
+    fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
+        self.0.insert(key.to_vec(), value.to_vec());
+        Ok(())
+    }
+
+    fn delete(&mut self, key: &[u8]) -> Result<(), Self::Error> {
+        self.0.remove(key);
+        Ok(())
+    }
+
+    fn clear_range(&mut self, start: Bound<&[u8]>, end: Bound<&[u8]>) -> Result<(), Self::Error> {
+        let keys: Vec<Vec<u8>> = self
+            .0
+            .keys()
+            .filter(|key| raw_bounds_contain(&start, &end, key))
+            .cloned()
+            .collect();
+        for key in keys {
+            self.0.remove(&key);
+        }
+        Ok(())
+    }
+}
+
+/// Whether one raw key lies within a pair of ordinary lexicographic bounds.
+fn raw_bounds_contain(start: &Bound<&[u8]>, end: &Bound<&[u8]>, key: &[u8]) -> bool {
+    let above_start = match start {
+        Bound::Included(bound) => key >= *bound,
+        Bound::Excluded(bound) => key > *bound,
+        Bound::Unbounded => true,
+    };
+    let below_end = match end {
+        Bound::Included(bound) => key <= *bound,
+        Bound::Excluded(bound) => key < *bound,
+        Bound::Unbounded => true,
+    };
+    above_start && below_end
+}
+
+/// Turn a materialized engine scan into the continuation shape required by
+/// [`KvStore::range`], without borrowing the engine after the scan returns.
+fn pairs_to_stream<'a>(mut pairs: VecDeque<KvPair>) -> KvStream<'a, FlatError<TestErr>> {
+    let Some(first) = pairs.pop_front() else {
+        return KvStream::empty();
+    };
+    KvStream::new(async move { Ok(Some((first, pairs_to_stream(pairs)))) })
+}
+
+/// A complete directory-native store over the shared flat-layout engine.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+struct FlatMapStore(FlatEngine<MapRaw>);
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+impl Default for FlatMapStore {
+    fn default() -> Self {
+        Self(FlatEngine::new(MapRaw::default()))
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+impl KvStore for FlatMapStore {
+    type Error = FlatError<TestErr>;
+
+    async fn get(&self, dir: &[&[u8]], key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.0.get(dir, key)
+    }
+
+    async fn set(&mut self, dir: &[&[u8]], key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
+        self.0.set(dir, key, value)
+    }
+
+    async fn delete(&mut self, dir: &[&[u8]], key: &[u8]) -> Result<(), Self::Error> {
+        self.0.delete(dir, key)
+    }
+
+    fn range<'a>(
+        &'a self,
+        dir: &[&[u8]],
+        start: Bound<&'a [u8]>,
+        end: Bound<&'a [u8]>,
+        reverse: bool,
+    ) -> KvStream<'a, Self::Error> {
+        match self.0.scan(dir, start, end, !reverse) {
+            Ok(pairs) => pairs_to_stream(pairs.into()),
+            Err(error) => KvStream::failed(error),
+        }
+    }
+
+    async fn clear_range(
+        &mut self,
+        dir: &[&[u8]],
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+    ) -> Result<(), Self::Error> {
+        self.0.clear_range(dir, start, end)
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+impl KvDirNav for FlatMapStore {
+    async fn list_dirs(&self, dir: &[&[u8]]) -> Result<Vec<Vec<u8>>, Self::Error> {
+        self.0.list_dirs(dir)
+    }
+
+    async fn dir_exists(&self, dir: &[&[u8]]) -> Result<bool, Self::Error> {
+        self.0.dir_exists(dir)
+    }
+
+    async fn remove_dir(&mut self, dir: &[&[u8]]) -> Result<bool, Self::Error> {
+        self.0.remove_dir(dir)
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod async_conformance {
+    use super::FlatMapStore;
+
+    crate::kv_store_tests!(store = FlatMapStore::default(), test_attr = tokio::test,);
+    crate::kv_nav_tests!(store = FlatMapStore::default(), test_attr = tokio::test,);
 }
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -221,107 +380,108 @@ fn kv_stream_failed_defers_a_setup_error() {
 
 #[cfg(all(test, target_arch = "wasm32", target_os = "unknown"))]
 mod browser_contract {
-    use core::cell::Cell;
+    use core::cell::RefCell;
     use core::mem::drop;
     use core::ops::Bound;
     use std::rc::Rc;
 
-    use super::TestErr;
+    use super::{MapRaw, TestErr, pairs_to_stream};
     use crate::commit::Commit;
+    use crate::flatengine::{FlatEngine, FlatError};
     use crate::nav::KvDirNav;
     use crate::scoped::ScopedKvStore;
     use crate::store::KvStore;
     use crate::stream::KvStream;
 
+    /// A working flat-layout store whose `Rc<RefCell<_>>` engine deliberately
+    /// proves that browser stores and the generated test futures need not be
+    /// `Send` or `Sync`.
+    #[derive(Clone)]
     struct BrowserStore {
-        state: Rc<Cell<u8>>,
+        engine: Rc<RefCell<FlatEngine<MapRaw>>>,
+    }
+
+    impl Default for BrowserStore {
+        fn default() -> Self {
+            Self {
+                engine: Rc::new(RefCell::new(FlatEngine::new(MapRaw::default()))),
+            }
+        }
     }
 
     impl KvStore for BrowserStore {
-        type Error = TestErr;
+        type Error = FlatError<TestErr>;
 
-        async fn get(&self, _dir: &[&[u8]], _key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-            self.state.set(self.state.get().wrapping_add(1));
-            Ok(None)
+        async fn get(&self, dir: &[&[u8]], key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+            self.engine.borrow().get(dir, key)
         }
 
         async fn set(
             &mut self,
-            _dir: &[&[u8]],
-            _key: &[u8],
-            _value: &[u8],
+            dir: &[&[u8]],
+            key: &[u8],
+            value: &[u8],
         ) -> Result<(), Self::Error> {
-            self.state.set(self.state.get().wrapping_add(1));
-            Ok(())
+            self.engine.borrow_mut().set(dir, key, value)
         }
 
-        async fn delete(&mut self, _dir: &[&[u8]], _key: &[u8]) -> Result<(), Self::Error> {
-            self.state.set(self.state.get().wrapping_add(1));
-            Ok(())
+        async fn delete(&mut self, dir: &[&[u8]], key: &[u8]) -> Result<(), Self::Error> {
+            self.engine.borrow_mut().delete(dir, key)
         }
 
         fn range<'a>(
             &'a self,
-            _dir: &[&[u8]],
-            _start: Bound<&'a [u8]>,
-            _end: Bound<&'a [u8]>,
-            _reverse: bool,
+            dir: &[&[u8]],
+            start: Bound<&'a [u8]>,
+            end: Bound<&'a [u8]>,
+            reverse: bool,
         ) -> KvStream<'a, Self::Error> {
-            let state = Rc::clone(&self.state);
-            KvStream::new(async move {
-                state.set(state.get().wrapping_add(1));
-                Ok(None)
-            })
+            let result = self.engine.borrow().scan(dir, start, end, !reverse);
+            match result {
+                Ok(pairs) => pairs_to_stream(pairs.into()),
+                Err(error) => KvStream::failed(error),
+            }
         }
 
         async fn clear_range(
             &mut self,
-            _dir: &[&[u8]],
-            _start: Bound<&[u8]>,
-            _end: Bound<&[u8]>,
+            dir: &[&[u8]],
+            start: Bound<&[u8]>,
+            end: Bound<&[u8]>,
         ) -> Result<(), Self::Error> {
-            self.state.set(self.state.get().wrapping_add(1));
-            Ok(())
+            self.engine.borrow_mut().clear_range(dir, start, end)
         }
     }
 
     impl KvDirNav for BrowserStore {
-        async fn list_dirs(&self, _dir: &[&[u8]]) -> Result<Vec<Vec<u8>>, Self::Error> {
-            Ok(Vec::new())
+        async fn list_dirs(&self, dir: &[&[u8]]) -> Result<Vec<Vec<u8>>, Self::Error> {
+            self.engine.borrow().list_dirs(dir)
         }
 
-        async fn dir_exists(&self, _dir: &[&[u8]]) -> Result<bool, Self::Error> {
-            Ok(false)
+        async fn dir_exists(&self, dir: &[&[u8]]) -> Result<bool, Self::Error> {
+            self.engine.borrow().dir_exists(dir)
         }
 
-        async fn remove_dir(&mut self, _dir: &[&[u8]]) -> Result<bool, Self::Error> {
-            Ok(false)
+        async fn remove_dir(&mut self, dir: &[&[u8]]) -> Result<bool, Self::Error> {
+            self.engine.borrow_mut().remove_dir(dir)
         }
     }
 
     impl Commit for BrowserStore {
-        type Error = TestErr;
+        type Error = FlatError<TestErr>;
 
         async fn commit(self) -> Result<(), Self::Error> {
-            self.state.set(self.state.get().wrapping_add(1));
             Ok(())
         }
     }
 
     async fn drive_browser_contract() {
-        let state = Rc::new(Cell::new(0));
-        let store = BrowserStore {
-            state: Rc::clone(&state),
-        };
+        let store = BrowserStore::default();
         let mut scoped = ScopedKvStore::new(store, vec![b"scope".to_vec()]);
         let _ = scoped.set(&[], b"key", b"value").await;
         let _ = scoped.dir_exists(&[]).await;
 
-        let stream_state = Rc::clone(&state);
-        let stream: KvStream<'static, TestErr> = KvStream::new(async move {
-            stream_state.set(stream_state.get().wrapping_add(1));
-            Ok(None)
-        });
+        let stream: KvStream<'static, FlatError<TestErr>> = KvStream::empty();
         let _ = stream.collect().await;
 
         let _ = scoped.commit().await;
@@ -330,5 +490,18 @@ mod browser_contract {
     #[test]
     fn thread_local_browser_storage_typechecks() {
         drop(drive_browser_contract());
+    }
+
+    mod async_conformance {
+        use super::BrowserStore;
+
+        crate::kv_store_tests!(
+            store = BrowserStore::default(),
+            test_attr = wasm_bindgen_test::wasm_bindgen_test,
+        );
+        crate::kv_nav_tests!(
+            store = BrowserStore::default(),
+            test_attr = wasm_bindgen_test::wasm_bindgen_test,
+        );
     }
 }

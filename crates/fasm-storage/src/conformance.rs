@@ -9,8 +9,10 @@
 /// reverse scans and range deletes, because the key schemas above them are
 /// written once against those answers. The near-term backend targets are
 /// FoundationDB and redb, with an in-memory store for tests and simulations.
-/// The crate now provides the browser's `?Send` formulation; an async test mode
-/// is the next step. This macro is the shared answer key.
+/// The same async bodies can be emitted either as synchronous `#[test]`
+/// wrappers or through a caller-provided async test attribute, including a
+/// browser runner whose futures are not `Send`. This macro is the shared
+/// answer key.
 ///
 /// # Invocation
 ///
@@ -38,6 +40,28 @@
 /// );
 /// ```
 ///
+/// An async test runner can instead be applied directly:
+///
+/// ```ignore
+/// fasm_storage::kv_store_tests!(
+///     store = MyStore::new(),
+///     test_attr = tokio::test,
+/// );
+/// ```
+///
+/// The browser form uses `wasm-bindgen-test`:
+///
+/// ```ignore
+/// fasm_storage::kv_store_tests!(
+///     store = MyIndexedDbStore::open().await,
+///     test_attr = wasm_bindgen_test::wasm_bindgen_test,
+/// );
+/// ```
+///
+/// A browser backend must call
+/// `wasm_bindgen_test_configure!(run_in_browser)` itself: IndexedDB is a
+/// browser API and is unavailable in wasm-bindgen-test's default Node runner.
+///
 /// The expansion defines free items (helper functions, a trait import) at the
 /// invocation site, so **invoke it inside a dedicated module**. Invoke it once
 /// per backend configuration you want covered.
@@ -47,10 +71,10 @@
 /// `store` may be evaluated more than once per generated test. Every evaluation
 /// must produce a **fresh, empty, independent** store. Tests write freely and
 /// never clean up, so a builder that hands back shared state will
-/// cross-contaminate. The expression is evaluated **inside** the future handed
-/// to `block_on`, so it may `.await` — `store = MyStore::open().await` is legal.
-/// It must not block on a runtime of its own, for the same reason. If your
-/// backend needs setup that can fail, panic in the builder.
+/// cross-contaminate. The expression is evaluated **inside** the generated
+/// async body, so it may `.await` — `store = MyStore::open().await` is legal.
+/// It must not block on a runtime of its own. If your backend needs setup that
+/// can fail, panic in the builder.
 ///
 /// # The `block_on` runner contract
 ///
@@ -73,6 +97,15 @@
 /// Runners that require `Send + 'static` futures (for example a bare
 /// `Handle::spawn` wrapper) do not satisfy the contract and will fail to
 /// compile against some of the generated tests.
+///
+/// # The `test_attr` contract
+///
+/// `test_attr` is a path to an attribute macro that turns an `async fn` into a
+/// test. The path is applied verbatim to every generated wrapper, and each
+/// wrapper awaits the same body used by `block_on` mode. The attribute owns
+/// runtime setup and any future bounds it imposes. `tokio::test` qualifies for
+/// native tests; `wasm_bindgen_test::wasm_bindgen_test` qualifies in browser
+/// builds and permits the thread-local futures browser storage requires.
 ///
 /// # What is covered
 ///
@@ -119,9 +152,17 @@
 #[macro_export]
 macro_rules! kv_store_tests {
     (store = $store:expr, block_on = $block_on:expr $(,)?) => {
+        $crate::kv_store_tests!(@emit (block_on $block_on), $store);
+    };
+    (store = $store:expr, test_attr = $attr:path $(,)?) => {
+        $crate::kv_store_tests!(@emit (test_attr $attr), $store);
+    };
+    (@emit $mode:tt, $store:expr) => {
         use $crate::__private::Bound;
+        #[allow(unused_imports)]
         use $crate::KvDirNav as _;
         use $crate::KvStore as _;
+        #[allow(unused_imports)]
         use $crate::RetryableStorageError as _;
 
         /// Bound over borrowed key bytes, as `KvStore::range` takes them.
@@ -197,10 +238,7 @@ macro_rules! kv_store_tests {
                 .collect()
         }
 
-        #[test]
-        fn kv_set_get_delete_round_trips() {
-            let run = $block_on;
-            run(async {
+        async fn kv_set_get_delete_round_trips_body() {
                 let mut store = $store;
 
                 for dir in &[D0, D1, D2, D3] {
@@ -247,13 +285,9 @@ macro_rules! kv_store_tests {
                             .expect("exists absent")
                     );
                 }
-            });
         }
 
-        #[test]
-        fn kv_scan_of_one_directory_never_yields_another() {
-            let run = $block_on;
-            run(async {
+        async fn kv_scan_of_one_directory_never_yields_another_body() {
                 let mut store = $store;
 
                 // The same key bytes in three different directories, with
@@ -292,13 +326,9 @@ macro_rules! kv_store_tests {
                         .await
                         .is_empty()
                 );
-            });
         }
 
-        #[test]
-        fn kv_orders_keys_lexicographically_within_each_directory() {
-            let run = $block_on;
-            run(async {
+        async fn kv_orders_keys_lexicographically_within_each_directory_body() {
                 let mut store = $store;
 
                 for dir in &[D0, D1, D2] {
@@ -312,13 +342,9 @@ macro_rules! kv_store_tests {
                         "directory {dir:?}"
                     );
                 }
-            });
         }
 
-        #[test]
-        fn kv_bounds_matrix_selects_exactly_the_bounded_keys() {
-            let run = $block_on;
-            run(async {
+        async fn kv_bounds_matrix_selects_exactly_the_bounded_keys_body() {
                 let mut store = $store;
                 seed(&mut store, D1, &[b"a", b"b", b"c", b"d"]).await;
 
@@ -370,13 +396,9 @@ macro_rules! kv_store_tests {
                         .is_empty()
                     );
                 }
-            });
         }
 
-        #[test]
-        fn kv_reverse_scan_returns_the_same_set_descending() {
-            let run = $block_on;
-            run(async {
+        async fn kv_reverse_scan_returns_the_same_set_descending_body() {
                 let mut store = $store;
                 for dir in &[D1, D2] {
                     seed(&mut store, dir, ORDER_KEYS).await;
@@ -396,13 +418,9 @@ macro_rules! kv_store_tests {
                 assert_eq!(fwd, expected_pairs);
                 let rev = scan(&store, D1, Bound::Included(b""), Bound::Excluded(K2), true).await;
                 assert_eq!(rev, fwd.into_iter().rev().collect::<Vec<_>>());
-            });
         }
 
-        #[test]
-        fn kv_scan_sees_overwrites_and_deletes() {
-            let run = $block_on;
-            run(async {
+        async fn kv_scan_sees_overwrites_and_deletes_body() {
                 let mut store = $store;
                 seed(&mut store, D1, &[b"a", b"b", b"c", b"d"]).await;
                 $crate::KvStore::set(&mut store, D1, b"b", b"overridden")
@@ -428,13 +446,9 @@ macro_rules! kv_store_tests {
                 // The same merged view, descending.
                 let rev = scan(&store, D1, Bound::Unbounded, Bound::Unbounded, true).await;
                 assert_eq!(rev, fwd.into_iter().rev().collect::<Vec<_>>());
-            });
         }
 
-        #[test]
-        fn kv_clear_range_bounded_and_reinsert() {
-            let run = $block_on;
-            run(async {
+        async fn kv_clear_range_bounded_and_reinsert_body() {
                 let mut store = $store;
                 seed(&mut store, D1, &[b"a", b"b", b"c", b"d", b"e"]).await;
 
@@ -478,17 +492,13 @@ macro_rules! kv_store_tests {
                     keys(&store, D1, Bound::Unbounded, Bound::Unbounded).await,
                     owned(&[b"a", b"c", b"d", b"e"])
                 );
-            });
         }
 
         // The Excluded start and Included end arms pin the bound
         // mapping on every backend (the FDB backend maps those arms by
         // hand, so a wrong `just_after` — e.g. clearing the excluded
         // start key itself — would otherwise ship unseen).
-        #[test]
-        fn kv_clear_range_excluded_start_included_end() {
-            let run = $block_on;
-            run(async {
+        async fn kv_clear_range_excluded_start_included_end_body() {
                 let mut store = $store;
                 seed(&mut store, D1, &[b"a", b"b", b"c", b"d"]).await;
 
@@ -511,13 +521,9 @@ macro_rules! kv_store_tests {
                     $crate::KvStore::get(&store, D1, b"c").await.expect("get c"),
                     None
                 );
-            });
         }
 
-        #[test]
-        fn kv_clear_range_whole_directory_keeps_the_directory() {
-            let run = $block_on;
-            run(async {
+        async fn kv_clear_range_whole_directory_keeps_the_directory_body() {
                 let mut store = $store;
                 seed(&mut store, D2, &[b"x", b"y"]).await;
                 assert!(
@@ -548,13 +554,9 @@ macro_rules! kv_store_tests {
                     keys(&store, D1, Bound::Unbounded, Bound::Unbounded).await,
                     owned(&[b"n"])
                 );
-            });
         }
 
-        #[test]
-        fn kv_clear_range_missing_directory_is_a_noop() {
-            let run = $block_on;
-            run(async {
+        async fn kv_clear_range_missing_directory_is_a_noop_body() {
                 let mut store = $store;
                 store
                     .clear_range(&[b"never"], Bound::Unbounded, Bound::Unbounded)
@@ -565,13 +567,9 @@ macro_rules! kv_store_tests {
                         .await
                         .expect("still absent")
                 );
-            });
         }
 
-        #[test]
-        fn kv_paged_traversal_over_a_thousand_rows() {
-            let run = $block_on;
-            run(async {
+        async fn kv_paged_traversal_over_a_thousand_rows_body() {
                 let mut store = $store;
 
                 // 1024 keys, zero-padded so lexicographic order is numeric.
@@ -631,13 +629,9 @@ macro_rules! kv_store_tests {
                 let hi = make(200);
                 let window = keys(&store, D0, Bound::Included(&lo), Bound::Excluded(&hi)).await;
                 assert_eq!(window, (100..200).map(make).collect::<Vec<_>>());
-            });
         }
 
-        #[test]
-        fn kv_take_limits_what_the_caller_polls() {
-            let run = $block_on;
-            run(async {
+        async fn kv_take_limits_what_the_caller_polls_body() {
                 let mut store = $store;
                 seed(&mut store, D1, &[b"a", b"b", b"c", b"d", b"e"]).await;
 
@@ -667,13 +661,9 @@ macro_rules! kv_store_tests {
                     .await
                     .expect("for_each must succeed");
                 assert_eq!(sink, owned(&[b"b", b"c", b"d"]));
-            });
         }
 
-        #[test]
-        fn kv_unknown_directory_reads_are_empty() {
-            let run = $block_on;
-            run(async {
+        async fn kv_unknown_directory_reads_are_empty_body() {
                 let mut store = $store;
                 seed(&mut store, D1, &[b"present"]).await;
 
@@ -689,7 +679,32 @@ macro_rules! kv_store_tests {
                         .await
                         .is_empty()
                 );
-            });
+        }
+
+        $crate::kv_store_tests!(@case $mode, kv_set_get_delete_round_trips, kv_set_get_delete_round_trips_body);
+        $crate::kv_store_tests!(@case $mode, kv_scan_of_one_directory_never_yields_another, kv_scan_of_one_directory_never_yields_another_body);
+        $crate::kv_store_tests!(@case $mode, kv_orders_keys_lexicographically_within_each_directory, kv_orders_keys_lexicographically_within_each_directory_body);
+        $crate::kv_store_tests!(@case $mode, kv_bounds_matrix_selects_exactly_the_bounded_keys, kv_bounds_matrix_selects_exactly_the_bounded_keys_body);
+        $crate::kv_store_tests!(@case $mode, kv_reverse_scan_returns_the_same_set_descending, kv_reverse_scan_returns_the_same_set_descending_body);
+        $crate::kv_store_tests!(@case $mode, kv_scan_sees_overwrites_and_deletes, kv_scan_sees_overwrites_and_deletes_body);
+        $crate::kv_store_tests!(@case $mode, kv_clear_range_bounded_and_reinsert, kv_clear_range_bounded_and_reinsert_body);
+        $crate::kv_store_tests!(@case $mode, kv_clear_range_excluded_start_included_end, kv_clear_range_excluded_start_included_end_body);
+        $crate::kv_store_tests!(@case $mode, kv_clear_range_whole_directory_keeps_the_directory, kv_clear_range_whole_directory_keeps_the_directory_body);
+        $crate::kv_store_tests!(@case $mode, kv_clear_range_missing_directory_is_a_noop, kv_clear_range_missing_directory_is_a_noop_body);
+        $crate::kv_store_tests!(@case $mode, kv_paged_traversal_over_a_thousand_rows, kv_paged_traversal_over_a_thousand_rows_body);
+        $crate::kv_store_tests!(@case $mode, kv_take_limits_what_the_caller_polls, kv_take_limits_what_the_caller_polls_body);
+        $crate::kv_store_tests!(@case $mode, kv_unknown_directory_reads_are_empty, kv_unknown_directory_reads_are_empty_body);
+    };
+    (@case (block_on $block_on:expr), $name:ident, $body:ident) => {
+        #[test]
+        fn $name() {
+            ($block_on)($body())
+        }
+    };
+    (@case (test_attr $attr:path), $name:ident, $body:ident) => {
+        #[$attr]
+        async fn $name() {
+            $body().await
         }
     };
 }
@@ -776,17 +791,65 @@ macro_rules! __kv_nav_helpers {
 /// uniform surface every backend must provide: the error is **not retryable**,
 /// and its `Display` text carries the [`KeyError`]'s own message verbatim
 /// (wrap it `#[error(transparent)]`-style or include the source).
+///
+/// # Invocation
+///
+/// The synchronous form accepts the same per-test blocking runner as
+/// [`kv_store_tests!`]:
+///
+/// ```ignore
+/// fasm_storage::kv_nav_tests!(
+///     store = MyStore::new(),
+///     block_on = futures::executor::block_on,
+/// );
+/// ```
+///
+/// Or apply an async test attribute directly:
+///
+/// ```ignore
+/// fasm_storage::kv_nav_tests!(
+///     store = MyStore::new(),
+///     test_attr = tokio::test,
+/// );
+/// ```
+///
+/// A browser backend uses the browser attribute:
+///
+/// ```ignore
+/// fasm_storage::kv_nav_tests!(
+///     store = MyIndexedDbStore::open().await,
+///     test_attr = wasm_bindgen_test::wasm_bindgen_test,
+/// );
+/// ```
+///
+/// The backend crate must call
+/// `wasm_bindgen_test_configure!(run_in_browser)` itself because IndexedDB is
+/// unavailable in wasm-bindgen-test's default Node runner.
+///
+/// # The `test_attr` contract
+///
+/// The path is applied verbatim to each generated `async fn` and must turn it
+/// into a test. It therefore controls the runtime and future bounds:
+/// `tokio::test` qualifies natively, while
+/// `wasm_bindgen_test::wasm_bindgen_test` qualifies in the browser and accepts
+/// the thread-local futures used by browser storage.
 #[macro_export]
 macro_rules! kv_nav_tests {
     (store = $store:expr, block_on = $block_on:expr $(,)?) => {
+        $crate::kv_nav_tests!(@emit (block_on $block_on), $store);
+    };
+    (store = $store:expr, test_attr = $attr:path $(,)?) => {
+        $crate::kv_nav_tests!(@emit (test_attr $attr), $store);
+    };
+    (@emit $mode:tt, $store:expr) => {
+        #[allow(unused_imports)]
         use $crate::KvDirNav as _;
+        #[allow(unused_imports)]
         use $crate::KvStore as _;
+        #[allow(unused_imports)]
         use $crate::RetryableStorageError as _;
         $crate::__kv_nav_helpers!();
-        #[test]
-        fn kv_nav_lists_immediate_children_sorted() {
-            let run = $block_on;
-            run(async {
+        async fn kv_nav_lists_immediate_children_sorted_body() {
                 let mut store = $store;
                 // The baseline root listing at suite start: children that
                 // exist before this suite runs (a committed top-level
@@ -835,13 +898,9 @@ macro_rules! kv_nav_tests {
                         .await
                         .expect("deep missing dir_exists")
                 );
-            });
         }
 
-        #[test]
-        fn kv_nav_remove_dir_is_recursive() {
-            let run = $block_on;
-            run(async {
+        async fn kv_nav_remove_dir_is_recursive_body() {
                 let mut store = $store;
                 let base = nav_list(&store, ND0).await;
                 nav_seed(&mut store, ND1, &[b"top"]).await;
@@ -915,13 +974,9 @@ macro_rules! kv_nav_tests {
                         .contains("the root directory cannot be removed"),
                     "expected the RootNotRemovable message, got: {err}"
                 );
-            });
         }
 
-        #[test]
-        fn kv_non_utf8_dir_segment_is_rejected() {
-            let run = $block_on;
-            run(async {
+        async fn kv_non_utf8_dir_segment_is_rejected_body() {
                 let mut store = $store;
                 let bad_segment: &[u8] = &[0xFFu8, 0xFEu8];
                 let bad: &[&[u8]] = &[bad_segment];
@@ -943,7 +998,22 @@ macro_rules! kv_nav_tests {
                         .await
                         .is_err_and(|e| e.to_string().contains("is not valid UTF-8"))
                 );
-            });
+        }
+
+        $crate::kv_nav_tests!(@case $mode, kv_nav_lists_immediate_children_sorted, kv_nav_lists_immediate_children_sorted_body);
+        $crate::kv_nav_tests!(@case $mode, kv_nav_remove_dir_is_recursive, kv_nav_remove_dir_is_recursive_body);
+        $crate::kv_nav_tests!(@case $mode, kv_non_utf8_dir_segment_is_rejected, kv_non_utf8_dir_segment_is_rejected_body);
+    };
+    (@case (block_on $block_on:expr), $name:ident, $body:ident) => {
+        #[test]
+        fn $name() {
+            ($block_on)($body())
+        }
+    };
+    (@case (test_attr $attr:path), $name:ident, $body:ident) => {
+        #[$attr]
+        async fn $name() {
+            $body().await
         }
     };
 }
