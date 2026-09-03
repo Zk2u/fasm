@@ -21,7 +21,7 @@ jobs:
       - name: clippy
         run: >
           cargo clippy
-          -p fasm-storage -p fasm-storage-btreemap -p fasm-storage-redb -p fasm-storage-fdb
+          -p fasm-storage -p fasm-storage-btreemap -p fasm-storage-redb -p fasm-storage-fdb -p fasm-storage-indexeddb
           --all-targets -- -D warnings
       - name: clippy (FDB test suite)
         run: >
@@ -47,6 +47,31 @@ jobs:
         run: cargo check -p fasm-storage --features test-utils --tests --target wasm32-unknown-unknown
       - name: clippy
         run: cargo clippy -p fasm-storage --features test-utils --tests --target wasm32-unknown-unknown -- -D warnings
+      - name: clippy (IndexedDB all targets)
+        run: cargo clippy -p fasm-storage-indexeddb --all-targets --target wasm32-unknown-unknown -- -D warnings
+
+  wasm-test:
+    name: IndexedDB backend tests (headless Chrome + Firefox)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.15.0
+      # ubuntu-latest ships Chrome and Firefox, and wasm-pack downloads the
+      # matching WebDriver. If this job breaks, check for a driver/browser
+      # version mismatch first.
+      - name: Test IndexedDB backend in Chrome
+        run: wasm-pack test --headless --chrome crates/fasm-storage-indexeddb
+      - name: Test IndexedDB backend in Firefox
+        run: wasm-pack test --headless --firefox crates/fasm-storage-indexeddb
 
   test:
     name: tests (FDB 7.3 live cluster)
