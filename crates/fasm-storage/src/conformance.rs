@@ -9,8 +9,8 @@
 /// reverse scans and range deletes, because the key schemas above them are
 /// written once against those answers. The near-term backend targets are
 /// FoundationDB and redb, with an in-memory store for tests and simulations.
-/// A browser backend is deferred: it needs a `?Send` formulation and an async
-/// test mode. This macro is the shared answer key.
+/// The crate now provides the browser's `?Send` formulation; an async test mode
+/// is the next step. This macro is the shared answer key.
 ///
 /// # Invocation
 ///

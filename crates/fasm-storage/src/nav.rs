@@ -14,6 +14,8 @@ use crate::store::KvStore;
 ///
 /// All three methods validate their directory path with
 /// [`validate_dir`](crate::validate_dir) before touching the engine.
+// See `KvStore`: auto-trait bounds are carried by the supertraits' markers.
+#[allow(async_fn_in_trait)]
 pub trait KvDirNav: KvStore {
     /// List the immediate child directory names under `dir`, as segment
     /// bytes, sorted ascending.

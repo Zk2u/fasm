@@ -1,3 +1,4 @@
+
 //! Ordered async byte-oriented key-value storage.
 //!
 //! This is the lowest storage layer for FASM state machines: an ordered map
@@ -53,8 +54,10 @@
 //!
 //! The trait and the plumbing live here; the concrete backends live in sibling
 //! crates: `fasm-storage-btreemap` (in-memory, tests and simulations only),
-//! `fasm-storage-redb`, and `fasm-storage-fdb`. A browser backend is deferred:
-//! it needs a `?Send` formulation and an async test mode.
+//! `fasm-storage-redb`, and `fasm-storage-fdb`. The target-aware portability
+//! markers preserve their native thread-safety contract while allowing a
+//! browser backend to be written against this crate with thread-local handles
+//! and futures.
 //!
 //! ## Example
 //!

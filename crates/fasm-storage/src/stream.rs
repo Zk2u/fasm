@@ -4,10 +4,14 @@ use core::fmt;
 use core::future::Future;
 use core::pin::Pin;
 
+use crate::maybe_send::MaybeSend;
+
 /// A key-value pair produced by a range scan.
 ///
-/// Keys are always reported in the caller's own key space: a [`ScopedKvStore`]
-/// strips its configured prefix before handing the pair back.
+/// Keys are always reported relative to the exact directory passed to
+/// [`KvStore::range`](crate::KvStore::range). A [`ScopedKvStore`] joins its
+/// pinned directory with the caller's relative directory, but the returned key
+/// remains the within-directory key.
 ///
 /// [`ScopedKvStore`]: crate::ScopedKvStore
 #[derive(Clone, PartialEq, Eq)]
@@ -29,8 +33,16 @@ impl fmt::Debug for KvPair {
 }
 
 /// The boxed future type inside a [`KvStream`].
+// Trait objects may add only auto traits such as `Send`; the target-aware
+// `MaybeSend` marker therefore cannot be written directly on this `dyn` type.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 type KvStreamFuture<'a, E> =
     Pin<Box<dyn Future<Output = Result<Option<(KvPair, KvStream<'a, E>)>, E>> + Send + 'a>>;
+
+/// The boxed future type inside a browser [`KvStream`].
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+type KvStreamFuture<'a, E> =
+    Pin<Box<dyn Future<Output = Result<Option<(KvPair, KvStream<'a, E>)>, E>> + 'a>>;
 
 /// An async stream of key-value pairs.
 ///
@@ -85,11 +97,13 @@ impl<E> fmt::Debug for KvStream<'_, E> {
 impl<'a, E> KvStream<'a, E> {
     /// Create a new stream from a future producing the head pair and the tail.
     ///
-    /// The future must be `Send` so that scans can cross task boundaries; it is
-    /// boxed, so backends are free to return `async` blocks of any shape.
+    /// On native targets the future must be `Send` so scans can cross task
+    /// boundaries. Browser futures may retain thread-local Web API handles. It
+    /// is boxed in either case, so backends may return async blocks of any
+    /// shape.
     pub fn new<F>(fut: F) -> Self
     where
-        F: Future<Output = Result<Option<(KvPair, KvStream<'a, E>)>, E>> + Send + 'a,
+        F: Future<Output = Result<Option<(KvPair, KvStream<'a, E>)>, E>> + MaybeSend + 'a,
     {
         Self {
             inner: Box::pin(fut),
@@ -114,7 +128,7 @@ impl<'a, E> KvStream<'a, E> {
     /// being swallowed.
     pub fn failed(err: E) -> Self
     where
-        E: Send + 'a,
+        E: MaybeSend + 'a,
     {
         Self {
             inner: Box::pin(async move { Err(err) }),

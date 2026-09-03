@@ -141,11 +141,16 @@ pub fn bound_as_slice(bound: &Bound<Vec<u8>>) -> Bound<&[u8]> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bound_as_slice, bound_to_owned, is_empty_range, next_prefix, prefix_range};
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    use super::{bound_as_slice, bound_to_owned};
+    use super::{is_empty_range, next_prefix, prefix_range};
     use core::ops::Bound;
 
+    // `proptest` reaches `wait-timeout`, which does not support browser wasm.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     use proptest::prelude::*;
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     use crate::tests::{arb_key, bounds_contain};
 
     #[test]
@@ -220,6 +225,7 @@ mod tests {
     }
 
     /// Arbitrary owned bound over [`arb_key`] bytes.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     fn arb_bound() -> impl Strategy<Value = Bound<Vec<u8>>> {
         prop_oneof![
             Just(Bound::Unbounded),
@@ -236,6 +242,7 @@ mod tests {
     /// first key past it (some byte carried, everything after it dropped — the
     /// shape a successor has), and its truncations. Those are generated
     /// deliberately, with unrelated keys mixed in.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     fn arb_key_near(prefix: Vec<u8>) -> impl Strategy<Value = Vec<u8>> {
         let extension = (Just(prefix.clone()), arb_key()).prop_map(|(mut key, tail)| {
             key.extend_from_slice(&tail);
@@ -273,10 +280,12 @@ mod tests {
     }
 
     /// A prefix together with a key from its neighbourhood.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     fn arb_prefix_and_key() -> impl Strategy<Value = (Vec<u8>, Vec<u8>)> {
         arb_key().prop_flat_map(|prefix| (Just(prefix.clone()), arb_key_near(prefix)))
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     proptest! {
         /// The defining property of [`prefix_range`]: its bounds select exactly
         /// the keys carrying the prefix, no more and no less. Every key schema

@@ -13,12 +13,18 @@ thiserror.workspace = true
 # crate already pulls in transitively (it declares rand 0.10).
 rand = "0.10"
 
-[dev-dependencies]
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+# The shared directory allocator uses rand's thread RNG. Browser builds must
+# seed it through Web Crypto rather than a native operating-system source.
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dev-dependencies]
 # Note: this crate deliberately has no dependency on a backend crate (that
 # would be a dev-dependency cycle, since backends depend on this one). The
 # store-backed tests therefore live in the backend crates; this crate's own
 # tests exercise only the pure logic (keyspace arithmetic, KvStream behavior)
 # against a local test-double error type.
+# `proptest` reaches `wait-timeout`, which does not support browser wasm.
 proptest.workspace = true
 
 [features]

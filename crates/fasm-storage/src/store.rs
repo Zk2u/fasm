@@ -5,15 +5,19 @@ use core::future::Future;
 use core::ops::Bound;
 
 use crate::error::RetryableStorageError;
-
+use crate::maybe_send::{MaybeSend, MaybeSync};
 use crate::stream::KvStream;
 
 /// Async ordered key-value store, scoped by directory.
 ///
 /// This trait abstracts over in-memory maps and the near-term backend targets,
-/// redb and FoundationDB. A browser backend is deferred: it needs a `?Send`
-/// formulation and an async test mode. Every operation is async so that
-/// network-backed and transactional engines fit without a blocking shim.
+/// redb and FoundationDB. [`MaybeSend`] and [`MaybeSync`] preserve the native
+/// `Send + Sync` contract while allowing browser storage handles to hold
+/// `JsValue`s, which are `!Send`. The browser exception deliberately targets
+/// only `wasm32-unknown-unknown`, rather than `target_family = "wasm"`, because
+/// targets such as `wasm32-wasip1-threads` have real threads. Every operation
+/// is async so that network-backed and transactional engines fit without a
+/// blocking shim.
 ///
 /// # Directories and keys
 ///
@@ -89,15 +93,12 @@ use crate::stream::KvStream;
 ///
 /// # Why `Send + Sync`
 ///
-/// The opaque futures returned by these methods capture the receiver
-/// (`&Self` or `&mut Self`). Handles must be `Send + Sync` so sessions
-/// built over them can be moved between tasks, and so generic wrappers
-/// such as [`ScopedKvStore`](crate::ScopedKvStore) can be written over an
-/// arbitrary `KV: KvStore`. The backends return `Send` futures, but the
-/// trait does not name that bound on the opaque return types.
-pub trait KvStore: Send + Sync {
+/// Handles are `Send + Sync` on native targets so sessions can move between
+/// tasks. The portability markers relax those bounds in the browser, where
+/// storage handles remain thread-local.
+pub trait KvStore: MaybeSend + MaybeSync {
     /// The error type for this store.
-    type Error: Error + RetryableStorageError + Send + Sync + 'static;
+    type Error: Error + RetryableStorageError + MaybeSend + MaybeSync + 'static;
 
     /// Get a value by directory and key.
     ///

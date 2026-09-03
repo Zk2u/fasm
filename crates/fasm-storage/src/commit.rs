@@ -4,6 +4,7 @@ use core::error::Error;
 use core::future::Future;
 
 use crate::error::RetryableStorageError;
+use crate::maybe_send::{MaybeSend, MaybeSync};
 
 /// Finalizes the writes performed through a mutable storage handle.
 ///
@@ -47,7 +48,7 @@ pub trait Commit {
     ///
     /// FoundationDB's `retryable_not_committed` distinction is the precedent:
     /// backends should map the equivalent guarantee onto `is_retryable`.
-    type Error: Error + RetryableStorageError + Send + Sync + 'static;
+    type Error: Error + RetryableStorageError + MaybeSend + MaybeSync + 'static;
 
     /// Finalize every write performed through this handle, atomically.
     ///
@@ -56,9 +57,9 @@ pub trait Commit {
     /// which guarantees that the attempt did not commit. A `false` result may
     /// mean the outcome is unknown; reconcile persisted state before replaying.
     ///
-    /// The returned future captures nothing beyond the handle itself;
-    /// the backends return `Send` futures, but the trait does not name
-    /// that bound on the opaque return type, matching
-    /// [`KvStore`](crate::KvStore) and [`KvDirNav`](crate::KvDirNav).
-    fn commit(self) -> impl Future<Output = Result<(), Self::Error>>;
+    /// On native targets [`MaybeSend`] has `Send` as a supertrait, so trait
+    /// elaboration still gives callers a `Send` future that can cross task
+    /// boundaries. In a browser it does not require `Send`, allowing a commit
+    /// future to retain thread-local Web API handles.
+    fn commit(self) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
 }

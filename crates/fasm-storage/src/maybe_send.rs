@@ -8,16 +8,9 @@
 /// here keeps conditional bounds out of the storage traits and preserves their
 /// native contract.
 ///
-/// # Implementing portable storage traits
-///
-/// An implementor that supports both target classes must pair
-/// `#[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")),`
-/// `async_trait::async_trait)]` with
-/// `#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"),`
-/// `async_trait::async_trait(?Send))]` on its implementation. The browser
-/// predicate is intentionally narrower than `target_family = "wasm"` because
-/// targets such as `wasm32-wasip1-threads` have real threads and must retain
-/// the native `Send` contract.
+/// Native `async fn` trait implementations need no target-specific attribute;
+/// use this marker on explicit future bounds that must retain the native
+/// `Send` contract while permitting thread-local browser futures.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub trait MaybeSend: Send {}
 
@@ -33,13 +26,9 @@ impl<T: Send> MaybeSend for T {}
 /// Keeping the distinction in this marker leaves the native storage contract
 /// intact.
 ///
-/// # Implementing portable storage traits
-///
-/// A portable implementation must use
-/// `#[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")),`
-/// `async_trait::async_trait)]` together with
-/// `#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"),`
-/// `async_trait::async_trait(?Send))]` so only browser futures may be `!Send`.
+/// Native `async fn` trait implementations need no target-specific attribute;
+/// use this marker on explicit future bounds that may be `!Send` only in the
+/// browser.
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub trait MaybeSend {}
 

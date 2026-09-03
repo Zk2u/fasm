@@ -63,6 +63,8 @@ pub fn validate_dir(dir: &[&[u8]]) -> Result<(), KeyError> {
 mod tests {
     use super::*;
 
+    // `proptest` reaches `wait-timeout`, which does not support browser wasm.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     use proptest::prelude::*;
 
     #[test]
@@ -91,6 +93,7 @@ mod tests {
         assert!(!KeyError::DirSegmentNotUtf8 { segment: 0 }.is_retryable());
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     proptest! {
         #[test]
         fn prop_validate_dir_matches_str_from_utf8(
