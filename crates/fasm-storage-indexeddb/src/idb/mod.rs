@@ -24,8 +24,16 @@ pub(crate) use request::{
     global_factory, read_cursor_page,
 };
 
+/// Object store containing application key/value rows.
+pub(crate) const KV_STORE: &str = "kv";
+/// Object store containing backend bookkeeping records.
+pub(crate) const META_STORE: &str = "meta";
 /// Maximum number of committed rows driven by one cursor callback chain.
 pub(crate) const PAGE_SIZE: usize = 256;
+/// Key of the revision fence in the metadata object store.
+pub(crate) const REVISION_KEY: &str = "revision";
+/// IndexedDB schema version understood by this backend.
+pub(crate) const SCHEMA_VERSION: u32 = 1;
 
 #[cfg(test)]
 pub(crate) mod fixture;

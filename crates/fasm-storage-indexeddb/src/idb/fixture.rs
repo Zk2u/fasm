@@ -4,13 +4,21 @@
 //! and store tests can exercise the browser without depending on a higher-level
 //! store implementation.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::{
+    future::Future,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
+use js_sys::{Function, Promise, Reflect};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
+use wasm_bindgen_futures::JsFuture;
 use web_sys::{Event, IdbDatabase, IdbObjectStore, IdbRequest, IdbTransaction, IdbTransactionMode};
 
-use super::{RequestFuture, TransactionEnd, TransactionOutcome, dom_error, global_factory};
-use crate::IndexedDbError;
+use super::{
+    KV_STORE, RequestFuture, TransactionEnd, TransactionOutcome, bytes_to_js, dom_error,
+    global_factory,
+};
+use crate::{IndexedDbError, IndexedDbStore, store::Scope};
 
 static NEXT_DATABASE: AtomicU32 = AtomicU32::new(1);
 
@@ -36,6 +44,91 @@ impl RawDatabase {
 pub(crate) fn unique_name(test_name: &str) -> String {
     let serial = NEXT_DATABASE.fetch_add(1, Ordering::Relaxed);
     format!("fasm-storage-indexeddb-{test_name}-{serial}")
+}
+
+/// Seeds committed root-directory rows in a valid flat-layout store.
+///
+/// Tests that bypass the public session surface must still stamp the exact
+/// layout metadata written by the directory driver. Otherwise any subsequent
+/// read correctly classifies their raw data as foreign.
+pub(crate) async fn seed_root_rows(
+    store: &IndexedDbStore,
+    rows: &[(&[u8], &[u8])],
+) -> Result<(), IndexedDbError> {
+    use fasm_storage::flatdir::{
+        COUNTER_KEY, LAYOUT_VERSION, ROOT_PREFIX, ROOT_PREFIX_KEY, VERSION_KEY, encode_varint,
+    };
+
+    let transaction = store.begin(IdbTransactionMode::Readwrite, Scope::Kv)?;
+    let outcome = TransactionOutcome::new(transaction.clone());
+    let object_store = from_js(transaction.object_store(KV_STORE))?;
+    let counter = encode_varint(1);
+    for (key, value) in [
+        (VERSION_KEY, LAYOUT_VERSION),
+        (ROOT_PREFIX_KEY, ROOT_PREFIX),
+        (COUNTER_KEY, counter.as_slice()),
+    ] {
+        from_js(object_store.put_with_key(&bytes_to_js(value), &bytes_to_js(key)))?;
+    }
+    for (key, value) in rows {
+        let mut raw_key = ROOT_PREFIX.to_vec();
+        raw_key.extend_from_slice(key);
+        from_js(object_store.put_with_key(&bytes_to_js(value), &bytes_to_js(&raw_key)))?;
+    }
+    await_complete(outcome).await
+}
+
+/// Yields to the browser event loop and resolves after at least `milliseconds`.
+pub(crate) async fn sleep_ms(milliseconds: u32) -> Result<(), IndexedDbError> {
+    let global = js_sys::global();
+    let set_timeout = Reflect::get(&global, &JsValue::from_str("setTimeout"))
+        .map_err(|value| dom_error(&value))?
+        .dyn_into::<Function>()
+        .map_err(|_| IndexedDbError::Unavailable)?;
+    let promise = Promise::new(&mut |resolve, reject| {
+        if let Err(value) = set_timeout.call2(
+            &global,
+            resolve.as_ref(),
+            &JsValue::from_f64(f64::from(milliseconds)),
+        ) {
+            let _ = reject.call1(&JsValue::UNDEFINED, &value);
+        }
+    });
+    JsFuture::from(promise)
+        .await
+        .map(|_| ())
+        .map_err(|value| dom_error(&value))
+}
+
+/// Rechecks an asynchronous condition until it succeeds or the deadline passes.
+///
+/// Browser storage work completes on later event-loop turns, so detached-
+/// operation tests must observe the promised effect rather than assume a fixed
+/// delay is long enough on every test runner.
+pub(crate) async fn wait_until<F, Fut>(
+    timeout_ms: u32,
+    mut predicate: F,
+) -> Result<(), IndexedDbError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<bool, IndexedDbError>>,
+{
+    let mut elapsed_ms = 0;
+    loop {
+        if predicate().await? {
+            return Ok(());
+        }
+        if elapsed_ms >= timeout_ms {
+            return Err(IndexedDbError::Backend {
+                name: "TimeoutError".to_owned(),
+                message: format!(
+                    "test condition was not satisfied within {timeout_ms} milliseconds"
+                ),
+            });
+        }
+        sleep_ms(10).await?;
+        elapsed_ms += 10;
+    }
 }
 
 /// Opens a fresh version-one database containing the object store `t`.

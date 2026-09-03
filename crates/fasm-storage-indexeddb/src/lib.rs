@@ -42,14 +42,18 @@
 //! name under a different storage key denotes a different database. One backend
 //! instance uses one such named database.
 //!
+//! On browser targets, [`IndexedDbStore`] opens and deletes those databases and
+//! owns the shared connection lifecycle. Clones of a handle share one browser
+//! connection rather than opening independent connections.
+//!
 //! # Tests and native builds
 //!
 //! Browser tests run with `wasm-pack test --headless --chrome` or
 //! `wasm-pack test --headless --firefox`. Node does not provide IndexedDB, so
 //! `wasm-pack test --node` is unsupported. Native targets compile this
-//! documentation, [`IndexedDbError`], [`Revision`], and the pure
-//! buffered-overlay implementation; browser API code stays behind the exact
-//! `wasm32-unknown-unknown` predicate.
+//! documentation, [`IndexedDbError`], [`Revision`], and the pure buffered-overlay
+//! implementation. [`IndexedDbStore`] and all browser API code stay behind the
+//! exact `wasm32-unknown-unknown` predicate.
 
 mod error;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -60,6 +64,14 @@ mod idb;
 #[allow(dead_code)]
 pub(crate) mod overlay;
 mod revision;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[allow(dead_code)]
+mod store;
 
 pub use error::IndexedDbError;
 pub use revision::Revision;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub use store::IndexedDbStore;
+
+#[cfg(all(test, all(target_arch = "wasm32", target_os = "unknown")))]
+mod store_tests;
