@@ -49,7 +49,7 @@ async fn raw_open(
 }
 
 async fn put_raw_row(store: &IndexedDbStore) -> Result<(), IndexedDbError> {
-    let transaction = store.transaction(IdbTransactionMode::Readwrite, Scope::Kv)?;
+    let transaction = store.begin(IdbTransactionMode::Readwrite, Scope::Kv)?;
     let outcome = TransactionOutcome::new(transaction.clone());
     let object_store = from_js(transaction.object_store(KV_STORE))?;
     from_js(object_store.put_with_key(&bytes_to_js(b"value"), &bytes_to_js(b"key")))?;
@@ -57,7 +57,7 @@ async fn put_raw_row(store: &IndexedDbStore) -> Result<(), IndexedDbError> {
 }
 
 async fn kv_count(store: &IndexedDbStore) -> Result<u32, IndexedDbError> {
-    let transaction = store.transaction(IdbTransactionMode::Readonly, Scope::Kv)?;
+    let transaction = store.begin(IdbTransactionMode::Readonly, Scope::Kv)?;
     let outcome = TransactionOutcome::new(transaction.clone());
     let object_store = from_js(transaction.object_store(KV_STORE))?;
     let count = RequestFuture::new(from_js(object_store.count())?).await?;
@@ -107,7 +107,7 @@ async fn open_twice_creates_schema_and_initial_revision() -> Result<(), IndexedD
         vec![KV_STORE.to_owned(), META_STORE.to_owned()]
     );
 
-    let transaction = first.transaction(IdbTransactionMode::Readonly, Scope::KvAndMeta)?;
+    let transaction = first.begin(IdbTransactionMode::Readonly, Scope::KvAndMeta)?;
     let outcome = TransactionOutcome::new(transaction.clone());
     let metadata = from_js(transaction.object_store(META_STORE))?;
     let revision =
@@ -132,7 +132,7 @@ async fn delete_removes_rows_and_recreates_revision() -> Result<(), IndexedDbErr
     let reopened = IndexedDbStore::open(&name).await?;
     assert_eq!(kv_count(&reopened).await?, 0);
 
-    let transaction = reopened.transaction(IdbTransactionMode::Readonly, Scope::KvAndMeta)?;
+    let transaction = reopened.begin(IdbTransactionMode::Readonly, Scope::KvAndMeta)?;
     let outcome = TransactionOutcome::new(transaction.clone());
     let metadata = from_js(transaction.object_store(META_STORE))?;
     let revision =
@@ -154,7 +154,7 @@ async fn versionchange_closes_handle_and_unblocks_upgrade() -> Result<(), Indexe
     assert!(store.is_closed());
     assert!(matches!(store.database(), Err(IndexedDbError::Closed)));
     assert!(matches!(
-        store.transaction(IdbTransactionMode::Readonly, Scope::Kv),
+        store.begin(IdbTransactionMode::Readonly, Scope::Kv),
         Err(IndexedDbError::Closed)
     ));
 

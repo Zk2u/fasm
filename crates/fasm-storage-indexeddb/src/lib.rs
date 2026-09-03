@@ -43,8 +43,10 @@
 //! instance uses one such named database.
 //!
 //! On browser targets, [`IndexedDbStore`] opens and deletes those databases and
-//! owns the shared connection lifecycle. Clones of a handle share one browser
-//! connection rather than opening independent connections.
+//! owns the shared connection lifecycle. It creates one-transition
+//! [`IndexedDbTransaction`] sessions and committed-data [`IndexedDbReader`]
+//! views. Clones of a store handle share one browser connection rather than
+//! opening independent connections.
 //!
 //! # Tests and native builds
 //!
@@ -59,19 +61,21 @@ mod error;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[allow(dead_code, unused_imports)]
 mod idb;
-// The browser I/O layer arrives in later commits. Keep its pure, crate-local
-// dependency compiled on every target in the meantime.
-#[allow(dead_code)]
 pub(crate) mod overlay;
 mod revision;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-#[allow(dead_code)]
+mod session;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod store;
 
 pub use error::IndexedDbError;
 pub use revision::Revision;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub use session::{IndexedDbReader, IndexedDbTransaction};
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub use store::IndexedDbStore;
 
+#[cfg(all(test, all(target_arch = "wasm32", target_os = "unknown")))]
+mod session_tests;
 #[cfg(all(test, all(target_arch = "wasm32", target_os = "unknown")))]
 mod store_tests;

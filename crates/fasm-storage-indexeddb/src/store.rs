@@ -17,10 +17,11 @@ use web_sys::{
 };
 
 use crate::{
-    IndexedDbError, Revision,
+    IndexedDbError, IndexedDbReader, IndexedDbTransaction, Revision,
     idb::{
-        DetachedId, KV_STORE, META_STORE, REVISION_KEY, SCHEMA_VERSION, detach, dom_error,
-        global_factory, log_detached_failure, release, revision_to_js,
+        DetachedId, KV_STORE, META_STORE, REVISION_KEY, RequestFuture, SCHEMA_VERSION,
+        TransactionEnd, TransactionOutcome, detach, dom_error, global_factory,
+        log_detached_failure, release, revision_from_js, revision_to_js,
     },
 };
 
@@ -96,6 +97,42 @@ impl IndexedDbStore {
         self.inner.closed.get()
     }
 
+    /// Starts one buffered state transition fenced by the current revision.
+    ///
+    /// A session represents exactly one state transition and can be committed
+    /// once. Its initial revision is the optimistic fence checked during that
+    /// commit. Opening a session early and committing it much later is safe,
+    /// but increases the chance of a false-positive [`IndexedDbError::Conflict`]
+    /// after an unrelated session advances the fence.
+    ///
+    /// A permanently closed store returns [`IndexedDbError::Closed`].
+    pub async fn transaction(&self) -> Result<IndexedDbTransaction, IndexedDbError> {
+        let transaction = self.begin(IdbTransactionMode::Readonly, Scope::Meta)?;
+        let metadata = transaction
+            .object_store(META_STORE)
+            .map_err(|value| dom_error(&value))?;
+        let request = metadata
+            .get(&JsValue::from_str(REVISION_KEY))
+            .map_err(|value| dom_error(&value))?;
+        let outcome = TransactionOutcome::new(transaction);
+        let revision = RequestFuture::new(request).await;
+        readonly_result(outcome.await)?;
+        let expected = revision_from_js(&revision?)?;
+
+        Ok(IndexedDbTransaction::new(self.clone(), expected))
+    }
+
+    /// Returns a read-only view over committed data.
+    ///
+    /// Each point read, and later each range page, uses its own readonly
+    /// IndexedDB transaction. A page is internally consistent, but a scan can
+    /// observe commits made between pages. This is weaker than redb's single
+    /// read transaction and FDB's single-transaction scan; the handle exists
+    /// to provide API parity where that per-page consistency is sufficient.
+    pub fn reader(&self) -> IndexedDbReader {
+        IndexedDbReader::new(self.clone())
+    }
+
     pub(crate) fn database(&self) -> Result<&IdbDatabase, IndexedDbError> {
         if self.is_closed() {
             Err(IndexedDbError::Closed)
@@ -104,7 +141,7 @@ impl IndexedDbStore {
         }
     }
 
-    pub(crate) fn transaction(
+    pub(crate) fn begin(
         &self,
         mode: IdbTransactionMode,
         scope: Scope,
@@ -112,6 +149,7 @@ impl IndexedDbStore {
         let database = self.database()?;
         let transaction = match scope {
             Scope::Kv => database.transaction_with_str_and_mode(KV_STORE, mode),
+            Scope::Meta => database.transaction_with_str_and_mode(META_STORE, mode),
             Scope::KvAndMeta => {
                 let stores = Array::new();
                 stores.push(&JsValue::from_str(KV_STORE));
@@ -138,9 +176,29 @@ impl IndexedDbStore {
 /// Object stores included in an IndexedDB transaction.
 pub(crate) enum Scope {
     /// The application key/value object store.
+    #[allow(dead_code)] // used from commit 7 (trait impl)
     Kv,
+    /// The revision metadata object store.
+    Meta,
     /// The application and revision metadata object stores.
+    #[allow(dead_code)] // used from commit 8 (commit)
     KvAndMeta,
+}
+
+pub(crate) fn readonly_result(outcome: TransactionEnd) -> Result<(), IndexedDbError> {
+    match outcome {
+        TransactionEnd::Complete => Ok(()),
+        TransactionEnd::Aborted { error } => match error {
+            Some(exception) => Err(IndexedDbError::Backend {
+                name: exception.name(),
+                message: exception.message(),
+            }),
+            None => Err(IndexedDbError::Backend {
+                name: "AbortError".to_owned(),
+                message: "readonly IndexedDB transaction aborted".to_owned(),
+            }),
+        },
+    }
 }
 
 struct Connection {
