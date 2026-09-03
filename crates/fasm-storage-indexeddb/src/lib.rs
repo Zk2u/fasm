@@ -47,11 +47,15 @@
 //! Browser tests run with `wasm-pack test --headless --chrome` or
 //! `wasm-pack test --headless --firefox`. Node does not provide IndexedDB, so
 //! `wasm-pack test --node` is unsupported. Native targets compile this
-//! documentation, [`IndexedDbError`], [`Revision`], and, in a later revision,
-//! the pure buffered-overlay implementation; browser API code stays behind the
-//! exact `wasm32-unknown-unknown` predicate.
+//! documentation, [`IndexedDbError`], [`Revision`], and the pure
+//! buffered-overlay implementation; browser API code stays behind the exact
+//! `wasm32-unknown-unknown` predicate.
 
 mod error;
+// The browser I/O layer arrives in later commits. Keep its pure, crate-local
+// dependency compiled on every target in the meantime.
+#[allow(dead_code)]
+pub(crate) mod overlay;
 mod revision;
 
 pub use error::IndexedDbError;
