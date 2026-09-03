@@ -29,6 +29,25 @@ jobs:
           -p fasm-storage-fdb --all-targets --features fdb-storage-tests
           -- -D warnings
 
+  # Keep fasm-storage browser-compatible for the IndexedDB backend's `?Send`
+  # formulation; `--tests` covers its compile contract and test-utils macros.
+  wasm-check:
+    name: check fasm-storage on wasm32
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - name: check
+        run: cargo check -p fasm-storage --features test-utils --tests --target wasm32-unknown-unknown
+      - name: clippy
+        run: cargo clippy -p fasm-storage --features test-utils --tests --target wasm32-unknown-unknown -- -D warnings
+
   test:
     name: tests (FDB 7.3 live cluster)
     runs-on: ubuntu-latest
