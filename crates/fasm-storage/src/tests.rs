@@ -18,6 +18,8 @@ use core::task::{Context, Poll, Waker};
 
 use proptest::prelude::*;
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use crate::MaybeSend;
 use crate::error::RetryableStorageError;
 use crate::stream::KvStream;
 
@@ -101,6 +103,18 @@ impl RetryableStorageError for TestErr {
     fn is_retryable(&self) -> bool {
         false
     }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[test]
+fn maybe_send_implies_send_on_native() {
+    fn assert_send<T: Send>() {}
+
+    fn via_marker<T: MaybeSend + 'static>() {
+        assert_send::<T>();
+    }
+
+    via_marker::<TestErr>();
 }
 
 #[test]

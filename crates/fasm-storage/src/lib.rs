@@ -29,6 +29,8 @@
 //!   state-transition invocation is one session is one commit.
 //! - [`RetryableStorageError`] — the contract every storage error answers, so
 //!   the layer above can tell "rerun the transition" from "fail closed".
+//! - [`MaybeSend`] and [`MaybeSync`] — target-aware portability markers that
+//!   preserve native thread-safety while permitting browser storage handles.
 //! - [`ScopedKvStore`] — a directory-pinned view over any backend: the caller
 //!   names keys only, every op lands in one directory; its inner-store escape
 //!   hatches are deliberate, not a capability boundary.
@@ -90,6 +92,7 @@ pub mod flatdir;
 pub mod flatengine;
 mod key;
 mod keyspace;
+mod maybe_send;
 mod nav;
 pub mod rawkv;
 mod scoped;
@@ -107,6 +110,7 @@ pub use error::RetryableStorageError;
 pub use flatengine::{DataBounds, FlatEngine, FlatError};
 pub use key::{Key, KeyError, validate_dir};
 pub use keyspace::{bound_as_slice, bound_to_owned, is_empty_range, next_prefix, prefix_range};
+pub use maybe_send::{MaybeSend, MaybeSync};
 pub use nav::KvDirNav;
 pub use rawkv::RawKv;
 pub use scoped::ScopedKvStore;
