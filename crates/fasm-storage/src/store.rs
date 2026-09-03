@@ -10,8 +10,8 @@ use crate::stream::KvStream;
 
 /// Async ordered key-value store, scoped by directory.
 ///
-/// This trait abstracts over in-memory maps and the near-term backend targets,
-/// redb and FoundationDB. Store types and method futures use [`MaybeSend`]
+/// This trait abstracts over the in-memory BTreeMap, redb, FoundationDB, and
+/// browser IndexedDB backends. Store types and method futures use [`MaybeSend`]
 /// (and store types also use [`MaybeSync`]): these mean `Send`/`Sync` on native
 /// targets but impose no thread-safety requirement in a browser, where storage
 /// handles may hold `JsValue`s. The browser exception deliberately targets only

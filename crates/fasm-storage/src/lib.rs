@@ -15,7 +15,7 @@
 //!         ▼
 //! KvStore + Commit            ← this crate: ordered async bytes
 //!         ▼
-//! BTreeMapStore · redb tx · FoundationDB tx   (backends, sibling crates)
+//! BTreeMapStore · redb tx · FoundationDB tx · IndexedDB session (browser wasm32-unknown-unknown)
 //! ```
 //!
 //! ## What this crate provides
@@ -53,10 +53,12 @@
 //!
 //! The trait and the plumbing live here; the concrete backends live in sibling
 //! crates: `fasm-storage-btreemap` (in-memory, tests and simulations only),
-//! `fasm-storage-redb`, and `fasm-storage-fdb`. The target-aware portability
-//! markers preserve their native thread-safety contract while allowing a
-//! browser backend to be written against this crate with thread-local handles
-//! and futures.
+//! `fasm-storage-redb`, `fasm-storage-fdb`, and `fasm-storage-indexeddb`
+//! (browser, `wasm32-unknown-unknown`). The IndexedDB backend buffers each
+//! session and applies it in one fenced readwrite commit using `?Send` browser
+//! futures. The conformance suite runs in the browser through its `test_attr`
+//! arm. The target-aware portability markers preserve the native backends'
+//! thread-safety contract while allowing browser storage handles and futures.
 //!
 //! ## Example
 //!

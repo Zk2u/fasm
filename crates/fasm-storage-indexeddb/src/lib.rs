@@ -1,9 +1,17 @@
 //! Browser [`KvStore`](fasm_storage::KvStore) storage backed by IndexedDB.
 //!
-//! This backend uses raw binary IndexedDB keys. IndexedDB orders binary keys
-//! bytewise, with a shorter prefix before the longer key, exactly matching the
-//! storage trait's ordering contract. No key encoding layer is needed, so the
-//! bytes chosen by a state machine remain the bytes visible to the database.
+//! IndexedDB stores the composite `flatdir` rows (`prefix ‖ key`) as binary
+//! keys. Its bytewise ordering of those rows preserves the caller's key order
+//! within one resolved directory.
+//!
+//! # Directories
+//!
+//! Directories use the same `fasm_storage::flatdir` byte layout as the
+//! btreemap and redb backends: version, counter, root prefix, mapping rows, and
+//! directory-prefixed data rows are identical on disk. IndexedDB reads are
+//! asynchronous, so this crate drives those shared byte rules through its own
+//! async directory layer instead of the synchronous `FlatEngine`. The FDB
+//! backend is the other backend with a native directory-layer driver.
 //!
 //! # Buffered sessions
 //!
@@ -38,8 +46,9 @@
 //!
 //! # Range scans
 //!
-//! Range scans fetch at most 256 committed rows per page, using a fresh
-//! readonly transaction for every page. Each cursor window ends at its last
+//! Range scans resolve one exact directory, then fetch at most 256 committed
+//! rows per page from that directory's data interval, using a fresh readonly
+//! transaction for every page. Each cursor window ends at its last
 //! committed seam key (or at the caller's terminal bound when exhausted), and
 //! buffered values and tombstones are merged only inside that window; a full
 //! page hidden entirely by tombstones advances to the next page rather than
@@ -57,9 +66,9 @@
 //! name under a different storage key denotes a different database. One backend
 //! instance uses one such named database.
 //!
-//! On browser targets, [`IndexedDbStore`] opens and deletes those databases and
+//! On browser targets, `IndexedDbStore` opens and deletes those databases and
 //! owns the shared connection lifecycle. It creates one-transition
-//! [`IndexedDbTransaction`] sessions and committed-data [`IndexedDbReader`]
+//! `IndexedDbTransaction` sessions and committed-data `IndexedDbReader`
 //! views. Clones of a store handle share one browser connection rather than
 //! opening independent connections.
 //!
@@ -69,7 +78,7 @@
 //! `wasm-pack test --headless --firefox`. Node does not provide IndexedDB, so
 //! `wasm-pack test --node` is unsupported. Native targets compile this
 //! documentation, [`IndexedDbError`], [`Revision`], and the pure buffered-overlay
-//! implementation. [`IndexedDbStore`] and all browser API code stay behind the
+//! implementation. `IndexedDbStore` and all browser API code stay behind the
 //! exact `wasm32-unknown-unknown` predicate.
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]

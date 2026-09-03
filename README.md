@@ -268,6 +268,24 @@ cargo test --package dentist_booking
 - **Cleaner API** — No more manual `Future` implementations required
 - **Renamed field** — `Input::TrackedActionCompleted { id, result }` (was `res`)
 
+## Storage backends
+
+The `fasm-storage` trait crate defines a directory-native, ordered async byte
+key-value store: every data operation names a directory and a key,
+`KvDirNav` lists and removes directories, and `Commit` supplies the atomic
+commit boundary.
+
+| crate | where it runs | directories | durability / atomicity | how it is tested |
+| --- | --- | --- | --- | --- |
+| `fasm-storage-btreemap` | in-process, for tests and simulations | shared flat layout via `FlatEngine` | buffered transaction with rollback on drop | native tests and proptest |
+| `fasm-storage-redb` | native | shared flat layout via `FlatEngine` | file-backed, single writer, with commit on a dedicated thread | native tests |
+| `fasm-storage-fdb` | native | FoundationDB's native directory layer | FoundationDB cluster with optimistic transactions | CI against a live FDB 7.3 cluster behind the `fdb-storage-tests` feature |
+| `fasm-storage-indexeddb` | browser (`wasm32-unknown-unknown`) | the same flat layout, driven asynchronously because IndexedDB reads cannot use the synchronous `FlatEngine` | IndexedDB buffered session with one fenced readwrite commit and an optimistic revision fence | `wasm-pack test --headless --chrome\|--firefox` |
+
+The `kv_store_tests!` and `kv_nav_tests!` conformance suites are the shared
+answer key for all four, run natively via `block_on` and in the browser via
+`test_attr`.
+
 ## Documentation
 
 - [Core Concepts](docs/01_core_concepts.md)

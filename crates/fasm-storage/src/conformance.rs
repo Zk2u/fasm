@@ -7,8 +7,8 @@
 ///
 /// Every backend must produce identical answers for ordering, bound semantics,
 /// reverse scans and range deletes, because the key schemas above them are
-/// written once against those answers. The near-term backend targets are
-/// FoundationDB and redb, with an in-memory store for tests and simulations.
+/// written once against those answers. The four backends are the in-memory
+/// BTreeMap, redb, FoundationDB, and browser IndexedDB stores.
 /// The same async bodies can be emitted either as synchronous `#[test]`
 /// wrappers or through a caller-provided async test attribute, including a
 /// browser runner whose futures are not `Send`. This macro is the shared
