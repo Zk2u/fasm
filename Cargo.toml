@@ -20,6 +20,7 @@ members = [
     "crates/fasm-storage-btreemap",
     "crates/fasm-storage-redb",
     "crates/fasm-storage-fdb",
+    "crates/fasm-storage-indexeddb",
 ]
 
 [workspace.package]
@@ -33,6 +34,7 @@ fasm-storage = { path = "crates/fasm-storage" }
 fasm-storage-btreemap = { path = "crates/fasm-storage-btreemap" }
 fasm-storage-redb = { path = "crates/fasm-storage-redb" }
 fasm-storage-fdb = { path = "crates/fasm-storage-fdb" }
+fasm-storage-indexeddb = { path = "crates/fasm-storage-indexeddb" }
 
 thiserror = "2"
 proptest = "1.11"
@@ -40,4 +42,8 @@ redb = "2"
 tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"
 foundationdb = "0.11"
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+web-sys = "0.3"
+wasm-bindgen-futures = "0.4"
 wasm-bindgen-test = "0.3"

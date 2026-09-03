@@ -1,0 +1,51 @@
+[package]
+name = "fasm-storage-indexeddb"
+version = "0.1.0"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "IndexedDB backend for the fasm-storage KvStore: a buffered browser session with one fenced readwrite commit"
+
+[dependencies]
+fasm-storage.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+wasm-bindgen.workspace = true
+js-sys.workspace = true
+wasm-bindgen-futures.workspace = true
+web-sys = { workspace = true, features = [
+    # Opening the named database and creating stores during an upgrade.
+    "IdbFactory",
+    "IdbOpenDbRequest",
+    "IdbDatabase",
+    # Issuing requests inside readonly and readwrite transactions.
+    "IdbTransaction",
+    "IdbTransactionMode",
+    "IdbObjectStore",
+    "IdbRequest",
+    # Ordered scans, pagination, and bounded key ranges.
+    "IdbCursor",
+    "IdbCursorWithValue",
+    "IdbCursorDirection",
+    "IdbKeyRange",
+    # Classifying DOM failures and listening for request lifecycle events.
+    "DomException",
+    "Event",
+    "EventTarget",
+    # Reporting failures from operations detached from their awaiting caller.
+    "console",
+] }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
+wasm-bindgen-test.workspace = true
+fasm-storage = { workspace = true, features = ["test-utils"] }
+
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dev-dependencies]
+# Property tests for the native overlay implementation added in the next commit.
+proptest.workspace = true
+
+[package.metadata.docs.rs]
+targets = ["wasm32-unknown-unknown"]
+default-target = "wasm32-unknown-unknown"
