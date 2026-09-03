@@ -27,7 +27,10 @@ pub(crate) struct WriteBuffer {
 /// [`Lookup::Miss`] is distinct from [`Lookup::Tombstone`]: only a miss allows
 /// the browser layer to fall back to the committed object store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // used from commit 7 (trait impl)
+#[cfg_attr(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    allow(dead_code)
+)] // used by browser-only session point reads
 pub(crate) enum Lookup<'a> {
     /// The session has set this value.
     Set(&'a [u8]),
@@ -50,19 +53,28 @@ impl WriteBuffer {
     }
 
     /// Buffers a value, replacing either an earlier value or a tombstone.
-    #[allow(dead_code)] // used from commit 7 (trait impl)
+    #[cfg_attr(
+        not(all(target_arch = "wasm32", target_os = "unknown")),
+        allow(dead_code)
+    )] // used by browser-only session writes
     pub(crate) fn set(&mut self, key: &[u8], value: &[u8]) {
         self.entries.insert(key.to_vec(), Some(value.to_vec()));
     }
 
     /// Buffers a tombstone, replacing any earlier value for the key.
-    #[allow(dead_code)] // used from commit 7 (trait impl)
+    #[cfg_attr(
+        not(all(target_arch = "wasm32", target_os = "unknown")),
+        allow(dead_code)
+    )] // used by browser-only session deletes
     pub(crate) fn delete(&mut self, key: &[u8]) {
         self.entries.insert(key.to_vec(), None);
     }
 
     /// Looks up a key without consulting the committed object store.
-    #[allow(dead_code)] // used from commit 7 (trait impl)
+    #[cfg_attr(
+        not(all(target_arch = "wasm32", target_os = "unknown")),
+        allow(dead_code)
+    )] // used by browser-only session point reads
     pub(crate) fn lookup(&self, key: &[u8]) -> Lookup<'_> {
         match self.entries.get(key) {
             Some(Some(value)) => Lookup::Set(value),
@@ -78,7 +90,10 @@ impl WriteBuffer {
     /// explicit tombstone so commit removes it. Buffered keys are selected
     /// here as well: this makes a clear after a set hide that set, while a set
     /// performed after the clear can deliberately reinsert the key.
-    #[allow(dead_code)] // used from commit 7 (trait impl)
+    #[cfg_attr(
+        not(all(target_arch = "wasm32", target_os = "unknown")),
+        allow(dead_code)
+    )] // used by browser-only range clears
     pub(crate) fn tombstone_keys(
         &mut self,
         committed_keys_in_range: impl IntoIterator<Item = Vec<u8>>,
@@ -135,7 +150,10 @@ impl WriteBuffer {
 /// tombstoned. That empty page must **not** end the stream: the cursor caller
 /// must advance with [`next_bounds`] until a visible row appears or the
 /// committed cursor is exhausted.
-#[allow(dead_code)] // used from commit 7 (range)
+#[cfg_attr(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    allow(dead_code)
+)] // used by browser-only range scans
 pub(crate) fn merge_page(
     buffer: &WriteBuffer,
     committed: Vec<(Vec<u8>, Vec<u8>)>,
@@ -181,7 +199,10 @@ pub(crate) fn merge_page(
 /// window instead extends to the caller's terminal bound so buffered-only keys
 /// after the last committed row are still emitted. Consequently the first
 /// window begins at the caller's bound, not at the first committed row.
-#[allow(dead_code)] // used from commit 7 (range)
+#[cfg_attr(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    allow(dead_code)
+)] // used by browser-only range scans
 pub(crate) fn page_window(
     lower: Bound<&[u8]>,
     upper: Bound<&[u8]>,
@@ -207,7 +228,10 @@ pub(crate) fn page_window(
 /// to the page that just completed. Forward scans advance the lower bound;
 /// reverse scans retreat the upper bound. The opposite, caller-supplied bound
 /// remains unchanged.
-#[allow(dead_code)] // used from commit 7 (range)
+#[cfg_attr(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    allow(dead_code)
+)] // used by browser-only range scans
 pub(crate) fn next_bounds(
     lower: Bound<&[u8]>,
     upper: Bound<&[u8]>,

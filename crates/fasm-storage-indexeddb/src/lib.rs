@@ -30,6 +30,15 @@
 //! the future cannot synchronously roll back work already submitted to
 //! IndexedDB.
 //!
+//! # Range scans
+//!
+//! Range scans fetch at most 256 committed rows per page, using a fresh
+//! readonly transaction for every page. Each cursor window ends at its last
+//! committed seam key (or at the caller's terminal bound when exhausted), and
+//! buffered values and tombstones are merged only inside that window; a full
+//! page hidden entirely by tombstones advances to the next page rather than
+//! ending the stream.
+//!
 //! A reader handle uses a fresh readonly transaction for each page. Every page
 //! is internally consistent, but changes committed between pages can appear in
 //! or disappear from the overall scan. Callers that require a stable logical
@@ -59,14 +68,19 @@
 
 mod error;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-#[allow(dead_code, unused_imports)]
+mod flat;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod idb;
 pub(crate) mod overlay;
 mod revision;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+mod scan;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod session;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod store;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+mod traits;
 
 pub use error::IndexedDbError;
 pub use revision::Revision;
@@ -75,6 +89,12 @@ pub use session::{IndexedDbReader, IndexedDbTransaction};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub use store::IndexedDbStore;
 
+#[cfg(all(test, all(target_arch = "wasm32", target_os = "unknown")))]
+mod conformance_tests;
+#[cfg(all(test, all(target_arch = "wasm32", target_os = "unknown")))]
+mod flat_tests;
+#[cfg(all(test, all(target_arch = "wasm32", target_os = "unknown")))]
+mod scan_tests;
 #[cfg(all(test, all(target_arch = "wasm32", target_os = "unknown")))]
 mod session_tests;
 #[cfg(all(test, all(target_arch = "wasm32", target_os = "unknown")))]

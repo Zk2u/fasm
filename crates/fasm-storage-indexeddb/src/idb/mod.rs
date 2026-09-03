@@ -19,9 +19,10 @@ pub(crate) use convert::{
     KeyRange, bytes_from_js, bytes_to_js, key_range, revision_from_js, revision_to_js,
 };
 pub(crate) use detached::{DetachedId, detach, log_detached_failure, release};
+#[cfg(test)]
+pub(crate) use request::{CursorPage, factory_from};
 pub(crate) use request::{
-    CursorPage, RequestFuture, TransactionEnd, TransactionOutcome, dom_error, factory_from,
-    global_factory, read_cursor_page,
+    RequestFuture, TransactionEnd, TransactionOutcome, dom_error, global_factory, read_cursor_page,
 };
 
 /// Object store containing application key/value rows.

@@ -176,7 +176,6 @@ impl IndexedDbStore {
 /// Object stores included in an IndexedDB transaction.
 pub(crate) enum Scope {
     /// The application key/value object store.
-    #[allow(dead_code)] // used from commit 7 (trait impl)
     Kv,
     /// The revision metadata object store.
     Meta,

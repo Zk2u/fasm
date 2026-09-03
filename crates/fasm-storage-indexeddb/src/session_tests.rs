@@ -2,6 +2,7 @@
 
 use std::ops::Bound;
 
+use fasm_storage::KvStore;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_test::wasm_bindgen_test;
 use web_sys::{IdbDatabase, IdbFactory, IdbRequest, IdbTransactionMode};
@@ -9,8 +10,9 @@ use web_sys::{IdbDatabase, IdbFactory, IdbRequest, IdbTransactionMode};
 use crate::{
     IndexedDbError, IndexedDbStore, Revision,
     idb::{
-        KV_STORE, META_STORE, REVISION_KEY, RequestFuture, TransactionOutcome, bytes_to_js,
-        dom_error, fixture::await_complete, fixture::unique_name, global_factory, revision_to_js,
+        META_STORE, REVISION_KEY, RequestFuture, TransactionOutcome, dom_error,
+        fixture::await_complete, fixture::seed_root_rows, fixture::unique_name, global_factory,
+        revision_to_js,
     },
     store::Scope,
 };
@@ -23,13 +25,7 @@ async fn seed_committed(
     store: &IndexedDbStore,
     rows: &[(&[u8], &[u8])],
 ) -> Result<(), IndexedDbError> {
-    let transaction = store.begin(IdbTransactionMode::Readwrite, Scope::Kv)?;
-    let outcome = TransactionOutcome::new(transaction.clone());
-    let object_store = from_js(transaction.object_store(KV_STORE))?;
-    for (key, value) in rows {
-        from_js(object_store.put_with_key(&bytes_to_js(value), &bytes_to_js(key)))?;
-    }
-    await_complete(outcome).await
+    seed_root_rows(store, rows).await
 }
 
 async fn put_raw_meta(store: &IndexedDbStore, value: &JsValue) -> Result<(), IndexedDbError> {
@@ -60,11 +56,11 @@ async fn session_reads_its_writes_without_changing_committed_data() -> Result<()
     let name = unique_name("read-writes");
     let store = IndexedDbStore::open(&name).await?;
     let mut session = store.transaction().await?;
-    session.write(b"k", b"v");
+    session.set(&[], b"k", b"v").await?;
 
-    assert_eq!(session.read(b"k").await?, Some(b"v".to_vec()));
-    assert!(session.contains(b"k").await?);
-    assert_eq!(store.reader().read(b"k").await?, None);
+    assert_eq!(session.get(&[], b"k").await?, Some(b"v".to_vec()));
+    assert!(session.exists(&[], b"k").await?);
+    assert_eq!(store.reader().get(&[], b"k").await?, None);
 
     drop(session);
     drop(store);
@@ -77,11 +73,11 @@ async fn tombstone_hides_committed_key_only_in_session() -> Result<(), IndexedDb
     let store = IndexedDbStore::open(&name).await?;
     seed_committed(&store, &[(&b"k"[..], &b"v"[..])]).await?;
     let mut session = store.transaction().await?;
-    session.remove(b"k");
+    session.delete(&[], b"k").await?;
 
-    assert_eq!(session.read(b"k").await?, None);
-    assert!(!session.contains(b"k").await?);
-    assert_eq!(store.reader().read(b"k").await?, Some(b"v".to_vec()));
+    assert_eq!(session.get(&[], b"k").await?, None);
+    assert!(!session.exists(&[], b"k").await?);
+    assert_eq!(store.reader().get(&[], b"k").await?, Some(b"v".to_vec()));
 
     drop(session);
     drop(store);
@@ -94,13 +90,13 @@ async fn reader_sees_only_committed_data() -> Result<(), IndexedDbError> {
     let store = IndexedDbStore::open(&name).await?;
     seed_committed(&store, &[(&b"a"[..], &b"va"[..])]).await?;
     let mut session = store.transaction().await?;
-    session.write(b"b", b"vb");
+    session.set(&[b"nested"], b"b", b"vb").await?;
     let reader = store.reader();
 
-    assert_eq!(reader.read(b"a").await?, Some(b"va".to_vec()));
-    assert!(reader.contains(b"a").await?);
-    assert_eq!(reader.read(b"b").await?, None);
-    assert!(!reader.contains(b"b").await?);
+    assert_eq!(reader.get(&[], b"a").await?, Some(b"va".to_vec()));
+    assert!(reader.exists(&[], b"a").await?);
+    assert_eq!(reader.get(&[b"nested"], b"b").await?, None);
+    assert!(!reader.exists(&[b"nested"], b"b").await?);
 
     drop(session);
     drop(reader);
@@ -122,11 +118,13 @@ async fn unbounded_clear_tombstones_every_committed_key() -> Result<(), IndexedD
     )
     .await?;
     let mut session = store.transaction().await?;
-    session.clear(Bound::Unbounded, Bound::Unbounded).await?;
+    session
+        .clear_range(&[], Bound::Unbounded, Bound::Unbounded)
+        .await?;
 
-    assert_eq!(session.read(b"a").await?, None);
-    assert_eq!(session.read(b"b").await?, None);
-    assert_eq!(session.read(b"c").await?, None);
+    assert_eq!(session.get(&[], b"a").await?, None);
+    assert_eq!(session.get(&[], b"b").await?, None);
+    assert_eq!(session.get(&[], b"c").await?, None);
     assert_eq!(session.pending_len(), 3);
 
     drop(session);
@@ -141,11 +139,11 @@ async fn write_after_clear_reinserts_key() -> Result<(), IndexedDbError> {
     seed_committed(&store, &[(&b"a"[..], &b"v1"[..])]).await?;
     let mut session = store.transaction().await?;
     session
-        .clear(Bound::Included(b"a"), Bound::Included(b"a"))
+        .clear_range(&[], Bound::Included(b"a"), Bound::Included(b"a"))
         .await?;
-    session.write(b"a", b"v2");
+    session.set(&[], b"a", b"v2").await?;
 
-    assert_eq!(session.read(b"a").await?, Some(b"v2".to_vec()));
+    assert_eq!(session.get(&[], b"a").await?, Some(b"v2".to_vec()));
 
     drop(session);
     drop(store);
@@ -158,13 +156,13 @@ async fn clear_tombstones_buffered_and_committed_keys() -> Result<(), IndexedDbE
     let store = IndexedDbStore::open(&name).await?;
     seed_committed(&store, &[(&b"a"[..], &b"va"[..])]).await?;
     let mut session = store.transaction().await?;
-    session.write(b"b", b"vb");
+    session.set(&[], b"b", b"vb").await?;
     session
-        .clear(Bound::Included(b"a"), Bound::Included(b"b"))
+        .clear_range(&[], Bound::Included(b"a"), Bound::Included(b"b"))
         .await?;
 
-    assert_eq!(session.read(b"a").await?, None);
-    assert_eq!(session.read(b"b").await?, None);
+    assert_eq!(session.get(&[], b"a").await?, None);
+    assert_eq!(session.get(&[], b"b").await?, None);
     assert_eq!(session.pending_len(), 2);
 
     drop(session);
@@ -179,14 +177,14 @@ async fn empty_and_inverted_clears_are_no_ops() -> Result<(), IndexedDbError> {
     seed_committed(&store, &[(&b"a"[..], &b"va"[..])]).await?;
     let mut session = store.transaction().await?;
     session
-        .clear(Bound::Included(b"c"), Bound::Included(b"a"))
+        .clear_range(&[], Bound::Included(b"c"), Bound::Included(b"a"))
         .await?;
     session
-        .clear(Bound::Excluded(b"a"), Bound::Included(b"a"))
+        .clear_range(&[], Bound::Excluded(b"a"), Bound::Included(b"a"))
         .await?;
 
     assert_eq!(session.pending_len(), 0);
-    assert_eq!(session.read(b"a").await?, Some(b"va".to_vec()));
+    assert_eq!(session.get(&[], b"a").await?, Some(b"va".to_vec()));
 
     drop(session);
     drop(store);
@@ -199,15 +197,15 @@ async fn mutation_order_around_clear_is_preserved() -> Result<(), IndexedDbError
     let store = IndexedDbStore::open(&name).await?;
     seed_committed(&store, &[(&b"d"[..], &b"vd"[..])]).await?;
     let mut session = store.transaction().await?;
-    session.write(b"a", b"va");
+    session.set(&[], b"a", b"va").await?;
     session
-        .clear(Bound::Included(b"a"), Bound::Included(b"c"))
+        .clear_range(&[], Bound::Included(b"a"), Bound::Included(b"c"))
         .await?;
-    session.write(b"b", b"vb");
+    session.set(&[], b"b", b"vb").await?;
 
-    assert_eq!(session.read(b"a").await?, None);
-    assert_eq!(session.read(b"b").await?, Some(b"vb".to_vec()));
-    assert_eq!(session.read(b"d").await?, Some(b"vd".to_vec()));
+    assert_eq!(session.get(&[], b"a").await?, None);
+    assert_eq!(session.get(&[], b"b").await?, Some(b"vb".to_vec()));
+    assert_eq!(session.get(&[], b"d").await?, Some(b"vd".to_vec()));
 
     drop(session);
     drop(store);
@@ -249,7 +247,7 @@ async fn closed_store_rejects_sessions_and_reader_operations() -> Result<(), Ind
         Err(IndexedDbError::Closed)
     ));
     assert!(matches!(
-        store.reader().read(b"k").await,
+        store.reader().get(&[], b"k").await,
         Err(IndexedDbError::Closed)
     ));
 

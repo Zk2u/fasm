@@ -2,26 +2,27 @@
 
 use std::{fmt, ops::Bound};
 
-use js_sys::Array;
-use web_sys::IdbTransactionMode;
+use fasm_storage::KvPair;
+use wasm_bindgen::JsValue;
+use web_sys::{IdbCursorDirection, IdbRequest, IdbTransactionMode};
 
 use crate::{
     IndexedDbError, IndexedDbStore, Revision,
+    flat::{self, RawAsync},
     idb::{
         KV_STORE, KeyRange, RequestFuture, TransactionOutcome, bytes_from_js, bytes_to_js,
-        dom_error, key_range,
+        dom_error, key_range, read_cursor_page,
     },
-    overlay::{Lookup, WriteBuffer},
+    overlay::{Lookup, WriteBuffer, merge_page},
     store::{Scope, readonly_result},
 };
 
 /// One buffered state transition against a named IndexedDB database.
 ///
-/// Point reads overlay pending writes and tombstones on committed data. The
+/// Directory-and-key reads overlay pending writes and tombstones on committed data. The
 /// buffer remains private to this session until the later commit operation
 /// applies it atomically after checking [`expected_revision`](Self::expected_revision).
 pub struct IndexedDbTransaction {
-    #[allow(dead_code)] // used from commit 7 (trait impl)
     store: IndexedDbStore,
     buffer: WriteBuffer,
     expected: Revision,
@@ -56,8 +57,21 @@ impl IndexedDbTransaction {
         self.expected
     }
 
-    #[allow(dead_code)] // used from commit 7 (trait impl)
-    pub(crate) async fn read(&self, key: &[u8]) -> Result<Option<Vec<u8>>, IndexedDbError> {
+    /// Read a key from one exact directory through the overlay-aware raw view.
+    pub(crate) async fn read(
+        &self,
+        dir: &[&[u8]],
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, IndexedDbError> {
+        let Some(mut raw_key) = flat::prefix_of(self, dir).await? else {
+            return Ok(None);
+        };
+        raw_key.extend_from_slice(key);
+        self.raw_read(&raw_key).await
+    }
+
+    /// Read a raw layout or data row with buffered writes taking precedence.
+    pub(crate) async fn raw_read(&self, key: &[u8]) -> Result<Option<Vec<u8>>, IndexedDbError> {
         match self.buffer.lookup(key) {
             Lookup::Set(value) => Ok(Some(value.to_vec())),
             Lookup::Tombstone => Ok(None),
@@ -65,8 +79,16 @@ impl IndexedDbTransaction {
         }
     }
 
-    #[allow(dead_code)] // used from commit 7 (trait impl)
-    pub(crate) async fn contains(&self, key: &[u8]) -> Result<bool, IndexedDbError> {
+    /// Test a key in one exact directory without transferring a committed value.
+    pub(crate) async fn contains(&self, dir: &[&[u8]], key: &[u8]) -> Result<bool, IndexedDbError> {
+        let Some(mut raw_key) = flat::prefix_of(self, dir).await? else {
+            return Ok(false);
+        };
+        raw_key.extend_from_slice(key);
+        self.raw_contains(&raw_key).await
+    }
+
+    async fn raw_contains(&self, key: &[u8]) -> Result<bool, IndexedDbError> {
         match self.buffer.lookup(key) {
             Lookup::Set(_) => Ok(true),
             Lookup::Tombstone => Ok(false),
@@ -74,18 +96,65 @@ impl IndexedDbTransaction {
         }
     }
 
-    #[allow(dead_code)] // used from commit 7 (trait impl)
-    pub(crate) fn write(&mut self, key: &[u8], value: &[u8]) {
-        self.buffer.set(key, value);
+    /// Buffer a key in one directory, allocating missing ancestors first.
+    pub(crate) async fn write(
+        &mut self,
+        dir: &[&[u8]],
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), IndexedDbError> {
+        let mut raw_key = flat::allocate_dir(self, dir).await?;
+        raw_key.extend_from_slice(key);
+        self.buffer.set(&raw_key, value);
+        Ok(())
     }
 
-    #[allow(dead_code)] // used from commit 7 (trait impl)
-    pub(crate) fn remove(&mut self, key: &[u8]) {
-        self.buffer.delete(key);
+    /// Buffer deletion of a key from one directory.
+    pub(crate) async fn remove(&mut self, dir: &[&[u8]], key: &[u8]) -> Result<(), IndexedDbError> {
+        let Some(mut raw_key) = flat::prefix_of(self, dir).await? else {
+            return Ok(());
+        };
+        raw_key.extend_from_slice(key);
+        self.buffer.delete(&raw_key);
+        Ok(())
     }
 
-    #[allow(dead_code)] // used from commit 7 (trait impl)
+    /// Buffer deletion of a caller-key range within one directory.
     pub(crate) async fn clear(
+        &mut self,
+        dir: &[&[u8]],
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+    ) -> Result<(), IndexedDbError> {
+        let Some(prefix) = flat::prefix_of(self, dir).await? else {
+            return Ok(());
+        };
+        let Some((start, end)) = flat::data_bounds(&prefix, start, end) else {
+            return Ok(());
+        };
+        self.raw_clear(bound_ref(&start), bound_ref(&end)).await?;
+        Ok(())
+    }
+
+    /// List immediate directory children through the async layout driver.
+    pub(crate) async fn list_directories(
+        &self,
+        dir: &[&[u8]],
+    ) -> Result<Vec<Vec<u8>>, IndexedDbError> {
+        flat::list_dirs(self, dir).await
+    }
+
+    /// Report whether the directory mapping has been materialised.
+    pub(crate) async fn directory_exists(&self, dir: &[&[u8]]) -> Result<bool, IndexedDbError> {
+        flat::dir_exists(self, dir).await
+    }
+
+    /// Buffer recursive removal of a directory subtree.
+    pub(crate) async fn remove_directory(&mut self, dir: &[&[u8]]) -> Result<bool, IndexedDbError> {
+        flat::remove_dir(self, dir).await
+    }
+
+    async fn raw_clear(
         &mut self,
         start: Bound<&[u8]>,
         end: Bound<&[u8]>,
@@ -101,7 +170,7 @@ impl IndexedDbTransaction {
 /// Each operation opens a short readonly browser transaction. The handle does
 /// not include a buffered session and therefore never exposes pending writes.
 pub struct IndexedDbReader {
-    store: IndexedDbStore,
+    pub(crate) store: IndexedDbStore,
 }
 
 impl fmt::Debug for IndexedDbReader {
@@ -118,19 +187,30 @@ impl IndexedDbReader {
         Self { store }
     }
 
-    #[allow(dead_code)] // used from commit 7 (trait impl)
-    pub(crate) async fn read(&self, key: &[u8]) -> Result<Option<Vec<u8>>, IndexedDbError> {
-        get_committed(&self.store, key).await
+    /// Read committed data from one exact directory.
+    pub(crate) async fn read(
+        &self,
+        dir: &[&[u8]],
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, IndexedDbError> {
+        let Some(mut raw_key) = flat::prefix_of(self, dir).await? else {
+            return Ok(None);
+        };
+        raw_key.extend_from_slice(key);
+        get_committed(&self.store, &raw_key).await
     }
 
-    #[allow(dead_code)] // used from commit 7 (trait impl)
-    pub(crate) async fn contains(&self, key: &[u8]) -> Result<bool, IndexedDbError> {
-        contains_committed(&self.store, key).await
+    /// Test committed data in one directory without transferring its value.
+    pub(crate) async fn contains(&self, dir: &[&[u8]], key: &[u8]) -> Result<bool, IndexedDbError> {
+        let Some(mut raw_key) = flat::prefix_of(self, dir).await? else {
+            return Ok(false);
+        };
+        raw_key.extend_from_slice(key);
+        contains_committed(&self.store, &raw_key).await
     }
 }
 
-#[allow(dead_code)] // used from commit 7 (trait impl)
-pub(crate) async fn get_committed(
+async fn get_committed(
     store: &IndexedDbStore,
     key: &[u8],
 ) -> Result<Option<Vec<u8>>, IndexedDbError> {
@@ -153,7 +233,6 @@ pub(crate) async fn get_committed(
     }
 }
 
-#[allow(dead_code)] // used from commit 7 (trait impl)
 async fn contains_committed(store: &IndexedDbStore, key: &[u8]) -> Result<bool, IndexedDbError> {
     let transaction = store.begin(IdbTransactionMode::Readonly, Scope::Kv)?;
     let object_store = transaction
@@ -175,39 +254,132 @@ async fn contains_committed(store: &IndexedDbStore, key: &[u8]) -> Result<bool, 
 /// tombstones. That is intentionally acceptable for the small per-swap
 /// prefixes this backend clears; large arbitrary ranges should use a paged
 /// design instead.
-#[allow(dead_code)] // used from commit 7 (trait impl)
-pub(crate) async fn committed_keys_in_range(
+async fn committed_keys_in_range(
     store: &IndexedDbStore,
     start: Bound<&[u8]>,
     end: Bound<&[u8]>,
 ) -> Result<Vec<Vec<u8>>, IndexedDbError> {
+    committed_rows_in_range(store, start, end, false)
+        .await
+        .map(|rows| rows.into_iter().map(|(key, _)| key).collect())
+}
+
+impl RawAsync for IndexedDbTransaction {
+    async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, IndexedDbError> {
+        self.raw_read(key).await
+    }
+
+    async fn scan_all(
+        &self,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+        reverse: bool,
+    ) -> Result<Vec<KvPair>, IndexedDbError> {
+        let committed = committed_rows_in_range(&self.store, start, end, reverse).await?;
+        Ok(merge_page(&self.buffer, committed, (start, end), reverse)
+            .into_iter()
+            .map(|(key, value)| KvPair { key, value })
+            .collect())
+    }
+
+    fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), IndexedDbError> {
+        self.buffer.set(key, value);
+        Ok(())
+    }
+
+    fn delete(&mut self, key: &[u8]) -> Result<(), IndexedDbError> {
+        self.buffer.delete(key);
+        Ok(())
+    }
+
+    async fn clear_range(
+        &mut self,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+    ) -> Result<(), IndexedDbError> {
+        self.raw_clear(start, end).await
+    }
+}
+
+impl RawAsync for IndexedDbReader {
+    async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, IndexedDbError> {
+        get_committed(&self.store, key).await
+    }
+
+    async fn scan_all(
+        &self,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+        reverse: bool,
+    ) -> Result<Vec<KvPair>, IndexedDbError> {
+        committed_rows_in_range(&self.store, start, end, reverse)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|(key, value)| KvPair { key, value })
+                    .collect()
+            })
+    }
+
+    fn insert(&mut self, _key: &[u8], _value: &[u8]) -> Result<(), IndexedDbError> {
+        Err(IndexedDbError::ReadOnly)
+    }
+
+    fn delete(&mut self, _key: &[u8]) -> Result<(), IndexedDbError> {
+        Err(IndexedDbError::ReadOnly)
+    }
+
+    async fn clear_range(
+        &mut self,
+        _start: Bound<&[u8]>,
+        _end: Bound<&[u8]>,
+    ) -> Result<(), IndexedDbError> {
+        Err(IndexedDbError::ReadOnly)
+    }
+}
+
+/// Materialise committed raw rows for directory metadata and clear operations.
+///
+/// User-facing scans use the paged implementation in `scan.rs`; this helper is
+/// intentionally limited to structural work that needs an owned merged view.
+pub(crate) async fn committed_rows_in_range(
+    store: &IndexedDbStore,
+    start: Bound<&[u8]>,
+    end: Bound<&[u8]>,
+    reverse: bool,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, IndexedDbError> {
     let range = key_range(start, end)?;
     if matches!(range, KeyRange::Empty) {
         return Ok(Vec::new());
     }
-
     let transaction = store.begin(IdbTransactionMode::Readonly, Scope::Kv)?;
     let object_store = transaction
         .object_store(KV_STORE)
         .map_err(|value| dom_error(&value))?;
-    let request = match range {
-        KeyRange::Empty => return Ok(Vec::new()),
-        KeyRange::All => object_store.get_all_keys(),
-        KeyRange::Bounded(range) => object_store.get_all_keys_with_key(range.as_ref()),
+    let request: IdbRequest = match (&range, reverse) {
+        (KeyRange::All, false) => object_store.open_cursor(),
+        (KeyRange::Bounded(range), false) => object_store.open_cursor_with_range(range.as_ref()),
+        (KeyRange::All, true) => object_store
+            .open_cursor_with_range_and_direction(&JsValue::UNDEFINED, IdbCursorDirection::Prev),
+        (KeyRange::Bounded(range), true) => object_store
+            .open_cursor_with_range_and_direction(range.as_ref(), IdbCursorDirection::Prev),
+        (KeyRange::Empty, _) => return Ok(Vec::new()),
     }
     .map_err(|value| dom_error(&value))?;
     let outcome = TransactionOutcome::new(transaction);
-    let keys = RequestFuture::new(request).await;
+    let page = read_cursor_page(request, usize::MAX).await;
     readonly_result(outcome.await)?;
-    let keys = keys?;
-    if !Array::is_array(&keys) {
-        return Err(IndexedDbError::Corrupt {
-            detail: "getAllKeys result is not an array".to_owned(),
-        });
-    }
-
-    Array::from(&keys)
-        .iter()
-        .map(|key| bytes_from_js(&key, "key"))
+    page?
+        .rows
+        .into_iter()
+        .map(|(key, value)| Ok((bytes_from_js(&key, "key")?, bytes_from_js(&value, "value")?)))
         .collect()
+}
+
+fn bound_ref(bound: &Bound<Vec<u8>>) -> Bound<&[u8]> {
+    match bound {
+        Bound::Unbounded => Bound::Unbounded,
+        Bound::Included(value) => Bound::Included(value),
+        Bound::Excluded(value) => Bound::Excluded(value),
+    }
 }
