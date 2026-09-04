@@ -56,9 +56,9 @@ pub trait Commit {
     /// which guarantees that the attempt did not commit. A `false` result may
     /// mean the outcome is unknown; reconcile persisted state before replaying.
     ///
-    /// The returned future is `Send`, matching [`KvStore`](crate::KvStore) and
-    /// [`KvStream`](crate::KvStream): a caller generic over `C: Commit` has to
-    /// be able to `spawn` the session, or hold it across an await inside a
-    /// `Send` task. A browser backend needing `?Send` is deferred crate-wide.
-    fn commit(self) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    /// The returned future captures nothing beyond the handle itself;
+    /// the backends return `Send` futures, but the trait does not name
+    /// that bound on the opaque return type, matching
+    /// [`KvStore`](crate::KvStore) and [`KvDirNav`](crate::KvDirNav).
+    fn commit(self) -> impl Future<Output = Result<(), Self::Error>>;
 }

@@ -60,7 +60,7 @@ type KvStreamFuture<'a, E> =
 /// use fasm_storage::KvStore;
 ///
 /// async fn demo<S: KvStore>(store: &S) -> Result<(), S::Error> {
-///     let mut cursor = store.range(Bound::Unbounded, Bound::Unbounded, false);
+///     let mut cursor = store.range(&[], Bound::Unbounded, Bound::Unbounded, false);
 ///     while let Some((pair, rest)) = cursor.next().await? {
 ///         println!("key has {} bytes", pair.key.len());
 ///         cursor = rest;

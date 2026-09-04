@@ -1,51 +1,66 @@
-//! The [`KvStore`] trait: an ordered async byte-to-byte map.
+//! The [`KvStore`] trait: an async byte-to-byte map scoped by directory.
 
 use core::error::Error;
+use core::future::Future;
 use core::ops::Bound;
 
-use async_trait::async_trait;
-
 use crate::error::RetryableStorageError;
+
 use crate::stream::KvStream;
 
-/// Async ordered key-value store.
+/// Async ordered key-value store, scoped by directory.
 ///
 /// This trait abstracts over in-memory maps and the near-term backend targets,
 /// redb and FoundationDB. A browser backend is deferred: it needs a `?Send`
 /// formulation and an async test mode. Every operation is async so that
 /// network-backed and transactional engines fit without a blocking shim.
 ///
+/// # Directories and keys
+///
+/// Every operation names a **directory** and a **key**. A directory is a
+/// sequence of segments (`&[&[u8]]`; the empty slice is the root directory);
+/// a key is an arbitrary byte sequence. The pair is the store's real key:
+/// the same key bytes in different directories are distinct entries, and a
+/// scan of one directory never yields another's keys.
+///
+/// **Directory segments are UTF-8** (the trait-level contract): every
+/// operation validates its directory with [`validate_dir`](crate::validate_dir) and rejects a
+/// non-UTF-8 segment with [`KeyError::DirSegmentNotUtf8`](crate::KeyError)
+/// before touching the engine. Keys have no such restriction.
+///
+/// Directories are created **lazily by the first write**: a `set` into a
+/// never-written directory allocates it (and any missing ancestor). Reads on
+/// a missing directory are empty, not an error — `get` answers `None`,
+/// `range` an empty stream. Existence is a query, [`KvDirNav::dir_exists`](crate::nav::KvDirNav::dir_exists)
+/// (crate root) — a directory with zero keys still exists.
+///
 /// # Ordering
 ///
 /// Keys are **arbitrary byte sequences** ordered **lexicographically by byte
-/// value**, exactly as [`Ord for [u8]`](slice) defines it. Shorter keys sort
-/// before longer keys that extend them, so `[1] < [1, 0] < [1, 0, 0] < [2]`.
-/// This is what makes `prefix ++ key` a usable namespacing scheme (see
-/// [`prefix_range`](crate::prefix_range)) and is not negotiable per backend:
-/// a store whose engine orders differently must translate.
+/// value**, exactly as [`Ord for [u8]`](slice) defines it, within their
+/// directory. Shorter keys sort before longer keys that extend them, so
+/// `[1] < [1, 0] < [1, 0, 0] < [2]`. This is what makes a resolved
+/// directory prefix a usable namespacing scheme and is not negotiable per
+/// backend: a store whose engine orders differently must translate.
 ///
 /// The empty key is a legal key and sorts first.
 ///
 /// # Range scans
 ///
-/// [`range`](KvStore::range) returns a continuation-based [`KvStream`]. This
-/// enables backends to fetch incrementally, but does not require it: a backend
-/// may prefetch pages or materialize a snapshot. [`KvStream::take`] limits
-/// continuation polling, not necessarily backend fetches.
+/// [`range`](KvStore::range) scans **one exact directory** between two key
+/// bounds and returns a continuation-based [`KvStream`] of
+/// [`KvPair`](crate::KvPair) whose `key` is the within-directory key — the
+/// directory is implicit in the scan. This enables backends to fetch
+/// incrementally, but does not require it: a backend may prefetch pages or
+/// materialize a snapshot. [`KvStream::take`] limits continuation polling,
+/// not necessarily backend fetches.
 ///
-/// Bounds are given in the caller's key space. A range whose keyed `start`
+/// Bounds are over the within-directory key. A range whose keyed `start`
 /// sorts after its keyed `end` is empty. Equal keyed bounds are empty when
 /// either bound is excluded; two included equal bounds select that one key.
-/// Backends whose native range API rejects empty bounds should normalize them
-/// with [`is_empty_range`](crate::is_empty_range).
 ///
-/// # Namespacing
-///
-/// The trait deliberately has no notion of tables, column families or
-/// namespaces. **Implementations are responsible for any key prefixing**;
-/// [`ScopedKvStore`](crate::ScopedKvStore) is the generic prefix-plumbing
-/// adapter for any backend; its public access to the inner store means it is not
-/// itself a capability boundary.
+/// Scans across directories (subtree scans, multi-directory scans) are not
+/// expressible in one call; the directory dimension is exact-match only.
 ///
 /// # Atomicity
 ///
@@ -72,50 +87,71 @@ use crate::stream::KvStream;
 /// distinguish "the transaction conflicted, rerun the transition" from "this
 /// data is corrupt, fail closed".
 ///
-/// # Why `Sync`
+/// # Why `Send + Sync`
 ///
-/// The `&self` methods return `Send` futures that capture `&Self`, which is
-/// only `Send` when `Self: Sync`. Every implementor therefore already had to be
-/// `Sync`; stating it as a supertrait is what lets generic wrappers such as
-/// [`ScopedKvStore`](crate::ScopedKvStore) be written over an arbitrary
-/// `KV: KvStore` at all.
-#[async_trait]
+/// The opaque futures returned by these methods capture the receiver
+/// (`&Self` or `&mut Self`). Handles must be `Send + Sync` so sessions
+/// built over them can be moved between tasks, and so generic wrappers
+/// such as [`ScopedKvStore`](crate::ScopedKvStore) can be written over an
+/// arbitrary `KV: KvStore`. The backends return `Send` futures, but the
+/// trait does not name that bound on the opaque return types.
 pub trait KvStore: Send + Sync {
     /// The error type for this store.
     type Error: Error + RetryableStorageError + Send + Sync + 'static;
 
-    /// Get a value by key.
+    /// Get a value by directory and key.
     ///
-    /// Returns `Ok(Some(value))` if the key is present, `Ok(None)` if it is not.
-    async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
+    /// Returns `Ok(Some(value))` if the key is present in the directory,
+    /// `Ok(None)` if it is not or the directory does not exist.
+    fn get(
+        &self,
+        dir: &[&[u8]],
+        key: &[u8],
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, Self::Error>>;
 
-    /// Set a key-value pair, overwriting any existing value for the key.
-    async fn set(&mut self, key: &[u8], value: &[u8]) -> Result<(), Self::Error>;
+    /// Set a key-value pair in a directory, overwriting any existing value
+    /// for the key. The directory (and any missing ancestor) is allocated
+    /// if needed.
+    fn set(
+        &mut self,
+        dir: &[&[u8]],
+        key: &[u8],
+        value: &[u8],
+    ) -> impl Future<Output = Result<(), Self::Error>>;
 
-    /// Delete a key.
+    /// Delete a key from a directory.
     ///
-    /// Deleting an absent key is a no-op, not an error.
-    async fn delete(&mut self, key: &[u8]) -> Result<(), Self::Error>;
+    /// Deleting an absent key or a key in a missing directory is a no-op,
+    /// not an error.
+    fn delete(
+        &mut self,
+        dir: &[&[u8]],
+        key: &[u8],
+    ) -> impl Future<Output = Result<(), Self::Error>>;
 
-    /// Check whether a key exists.
+    /// Check whether a key exists in a directory.
     ///
     /// The default implementation goes through [`get`](KvStore::get) and
     /// therefore pays for transferring the value. Backends with a cheaper
     /// existence probe should override it.
-    async fn exists(&self, key: &[u8]) -> Result<bool, Self::Error> {
-        Ok(self.get(key).await?.is_some())
+    fn exists(&self, dir: &[&[u8]], key: &[u8]) -> impl Future<Output = Result<bool, Self::Error>> {
+        async move { self.get(dir, key).await.map(|v| v.is_some()) }
     }
 
-    /// Scan a range of keys in lexicographic order.
+    /// Scan the keys of one directory between two key bounds, in
+    /// lexicographic order.
     ///
-    /// Results are exposed through the returned continuation-based [`KvStream`].
+    /// Results are exposed through the returned continuation-based
+    /// [`KvStream`]; each pair's key is the within-directory key.
     ///
     /// # Arguments
     ///
-    /// * `start` — start bound (included / excluded / unbounded)
+    /// * `dir` — the exact directory to scan (validated UTF-8 segments).
+    /// * `start` — start bound over the within-directory key
+    ///   (included / excluded / unbounded)
     /// * `end` — end bound (included / excluded / unbounded)
-    /// * `reverse` — if `true`, produce the same set of pairs in descending key
-    ///   order. `reverse` changes the iteration direction only; it never
+    /// * `reverse` — if `true`, produce the same set of pairs in descending
+    ///   key order. `reverse` changes the iteration direction only; it never
     ///   reinterprets which bound is which.
     ///
     /// # Examples
@@ -126,43 +162,45 @@ pub trait KvStore: Send + Sync {
     /// use fasm_storage::KvStore;
     ///
     /// async fn demo<S: KvStore>(store: &S) -> Result<(), S::Error> {
-    ///     // All keys from "a" (inclusive) to "z" (exclusive).
+    ///     // In directory `["pool"]`, all keys from "a" (inclusive) to
+    ///     // "z" (exclusive).
     ///     let _ = store
-    ///         .range(Bound::Included(b"a"), Bound::Excluded(b"z"), false)
+    ///         .range(&[b"pool"], Bound::Included(b"a"), Bound::Excluded(b"z"), false)
     ///         .collect()
     ///         .await?;
     ///
-    ///     // All keys starting from "start".
-    ///     let _ = store
-    ///         .range(Bound::Included(b"start"), Bound::Unbounded, false)
-    ///         .collect()
-    ///         .await?;
+    ///     // In the root directory, all keys starting from "start".
+    ///     let _ = store.range(&[], Bound::Included(b"start"), Bound::Unbounded, false);
     ///
-    ///     // Everything, newest key first.
-    ///     let _ = store
-    ///         .range(Bound::Unbounded, Bound::Unbounded, true)
-    ///         .collect()
-    ///         .await?;
+    ///     // The whole root directory, newest key first.
+    ///     let _ = store.range(&[], Bound::Unbounded, Bound::Unbounded, true);
     ///     Ok(())
     /// }
     /// # fn main() {}
     /// ```
     fn range<'a>(
         &'a self,
-        start: Bound<&[u8]>,
-        end: Bound<&[u8]>,
+        dir: &[&[u8]],
+        start: Bound<&'a [u8]>,
+        end: Bound<&'a [u8]>,
         reverse: bool,
     ) -> KvStream<'a, Self::Error>;
 
-    /// Delete every key in a range.
+    /// Delete every key in a range within one directory.
     ///
-    /// Semantically identical to scanning the range and deleting each key, but
-    /// backends with a native range delete should use it. Clearing a range that
-    /// matches nothing is a no-op, not an error. The same empty-bound rules as
+    /// Semantically identical to scanning the range and deleting each key,
+    /// but backends with a native range delete should use it. Clearing a
+    /// range that matches nothing is a no-op, not an error — including a
+    /// missing directory. The same empty-bound rules as
     /// [`range`](KvStore::range) apply, including inverted keyed bounds.
-    async fn clear_range(
+    ///
+    /// Clearing a directory's whole range (`Unbounded` to `Unbounded`)
+    /// removes all of its keys but **not** the directory itself:
+    /// [`KvDirNav::dir_exists`](crate::nav::KvDirNav::dir_exists) (crate root) still answers `true` after.
+    fn clear_range(
         &mut self,
+        dir: &[&[u8]],
         start: Bound<&[u8]>,
         end: Bound<&[u8]>,
-    ) -> Result<(), Self::Error>;
+    ) -> impl Future<Output = Result<(), Self::Error>>;
 }
