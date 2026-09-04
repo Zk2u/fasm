@@ -9,7 +9,6 @@ description = "redb backend for the fasm-storage KvStore: a transactional file-b
 
 [dependencies]
 fasm-storage.workspace = true
-async-trait.workspace = true
 thiserror.workspace = true
 redb.workspace = true
 # tokio: commit is handed to a dedicated std::thread over an unbounded mpsc

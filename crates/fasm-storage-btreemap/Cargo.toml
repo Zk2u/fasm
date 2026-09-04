@@ -5,11 +5,10 @@ edition.workspace = true
 repository.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "In-memory BTreeMap backend for the fasm-storage KvStore; for tests and simulations only (no crash atomicity, commit is a no-op)"
+description = "In-memory BTreeMap backend for the fasm-storage KvStore; for tests and simulations only (buffers writes; commit applies the buffer atomically and drop rolls back; no crash atomicity)"
 
 [dependencies]
 fasm-storage.workspace = true
-async-trait.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

@@ -34,7 +34,6 @@ fasm-storage-btreemap = { path = "crates/fasm-storage-btreemap" }
 fasm-storage-redb = { path = "crates/fasm-storage-redb" }
 fasm-storage-fdb = { path = "crates/fasm-storage-fdb" }
 
-async-trait = "0.1"
 thiserror = "2"
 proptest = "1.11"
 redb = "2"
