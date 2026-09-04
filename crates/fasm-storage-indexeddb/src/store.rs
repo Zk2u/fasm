@@ -17,10 +17,11 @@ use crate::{
     IndexedDbError, IndexedDbReader, IndexedDbTransaction, Revision,
     idb::{
         DetachedId, KV_STORE, META_STORE, REVISION_KEY, RequestFuture, SCHEMA_VERSION,
-        TransactionEnd, TransactionOutcome, detach, dom_error, global_factory,
-        log_detached_failure, release, revision_from_js, revision_to_js,
+        TransactionEnd, TransactionOutcome, bytes_from_js, detach, dom_error, global_factory,
+        log_detached_failure, read_cursor_page, release, revision_from_js, revision_to_js,
     },
     operation::{OperationReceiver, OperationSender},
+    overlay::Rows,
 };
 
 type EventHandler = RefCell<Option<Closure<dyn FnMut(Event)>>>;
@@ -95,40 +96,66 @@ impl IndexedDbStore {
         self.inner.closed.get()
     }
 
-    /// Starts one buffered state transition fenced by the current revision.
+    /// Captures all raw rows and their revision for one state transition.
     ///
-    /// A session represents exactly one state transition and can be committed
-    /// once. Its initial revision is the optimistic fence checked during that
-    /// commit. Opening a session early and committing it much later is safe,
-    /// but increases the chance of a false-positive [`IndexedDbError::Conflict`]
-    /// after an unrelated session advances the fence.
-    ///
-    /// A permanently closed store returns [`IndexedDbError::Closed`].
+    /// This costs a full database read and an owned copy in memory. Reads stay
+    /// stable for the session's lifetime; commit checks the captured revision
+    /// before applying only the buffered changes. Concurrent commits, even to
+    /// unrelated directories, make this session's commit return `Conflict`.
     pub async fn transaction(&self) -> Result<IndexedDbTransaction, IndexedDbError> {
-        let transaction = self.begin(IdbTransactionMode::Readonly, Scope::Meta)?;
-        let metadata = transaction
-            .object_store(META_STORE)
-            .map_err(|value| dom_error(&value))?;
-        let request = metadata
-            .get(&JsValue::from_str(REVISION_KEY))
-            .map_err(|value| dom_error(&value))?;
-        let outcome = TransactionOutcome::new(transaction);
-        let revision = RequestFuture::new(request).await;
-        readonly_result(outcome.await)?;
-        let expected = revision_from_js(&revision?)?;
-
-        Ok(IndexedDbTransaction::new(self.clone(), expected))
+        let (rows, expected) = self.snapshot().await?;
+        Ok(IndexedDbTransaction::new(self.clone(), expected, rows))
     }
 
-    /// Returns a read-only view over committed data.
+    /// Captures a read-only snapshot of the whole database.
     ///
-    /// Each point read, and later each range page, uses its own readonly
-    /// IndexedDB transaction. A page is internally consistent, but a scan can
-    /// observe commits made between pages. This is weaker than redb's single
-    /// read transaction and FDB's single-transaction scan; the handle exists
-    /// to provide API parity where that per-page consistency is sufficient.
-    pub fn reader(&self) -> IndexedDbReader {
-        IndexedDbReader::new(self.clone())
+    /// Reads and scans remain stable across later commits. Call this method
+    /// again to refresh; opening a reader performs a full database read and
+    /// retains an owned copy until the reader is dropped.
+    pub async fn reader(&self) -> Result<IndexedDbReader, IndexedDbError> {
+        let (rows, _) = self.snapshot().await?;
+        Ok(IndexedDbReader::new(self.clone(), rows))
+    }
+
+    async fn snapshot(&self) -> Result<(Rows, Revision), IndexedDbError> {
+        // Enqueue BOTH requests and install ALL handlers before the first
+        // await. They share one readonly transaction over kv + meta, so the
+        // returned rows can never be paired with a different revision.
+        let transaction = self.begin(IdbTransactionMode::Readonly, Scope::KvAndMeta)?;
+        let outcome = TransactionOutcome::new(transaction.clone());
+        let metadata = transaction
+            .object_store(META_STORE)
+            .map_err(|v| dom_error(&v))?;
+        let kv = transaction
+            .object_store(KV_STORE)
+            .map_err(|v| dom_error(&v))?;
+        let revision = RequestFuture::new(
+            metadata
+                .get(&JsValue::from_str(REVISION_KEY))
+                .map_err(|v| dom_error(&v))?,
+        );
+        let cursor = read_cursor_page(kv.open_cursor().map_err(|v| dom_error(&v))?, usize::MAX);
+        let revision = revision.await;
+        let page = cursor.await;
+        readonly_result(outcome.await)?;
+        let expected = revision_from_js(&revision?)?;
+        let page = page?;
+        if !page.exhausted {
+            return Err(IndexedDbError::Corrupt {
+                detail: "snapshot cursor did not exhaust the database".to_owned(),
+            });
+        }
+        let mut rows = Rows::new();
+        for (key, value) in page.rows {
+            let key = bytes_from_js(&key, "key")?;
+            let value = bytes_from_js(&value, "value")?;
+            if rows.insert(key, value).is_some() {
+                return Err(IndexedDbError::Corrupt {
+                    detail: "duplicate binary key in snapshot".to_owned(),
+                });
+            }
+        }
+        Ok((rows, expected))
     }
 
     pub(crate) fn database(&self) -> Result<&IdbDatabase, IndexedDbError> {
@@ -146,6 +173,7 @@ impl IndexedDbStore {
     ) -> Result<IdbTransaction, IndexedDbError> {
         let database = self.database()?;
         let transaction = match scope {
+            #[cfg(test)]
             Scope::Kv => database.transaction_with_str_and_mode(KV_STORE, mode),
             Scope::Meta => database.transaction_with_str_and_mode(META_STORE, mode),
             Scope::KvAndMeta => {
@@ -168,6 +196,7 @@ impl IndexedDbStore {
     pub(crate) fn begin_durable(&self, scope: Scope) -> Result<IdbTransaction, IndexedDbError> {
         let database = self.database()?;
         let store_names = match scope {
+            #[cfg(test)]
             Scope::Kv => JsValue::from_str(KV_STORE),
             Scope::Meta => JsValue::from_str(META_STORE),
             Scope::KvAndMeta => {
@@ -217,6 +246,7 @@ impl IndexedDbStore {
 /// Object stores included in an IndexedDB transaction.
 pub(crate) enum Scope {
     /// The application key/value object store.
+    #[cfg(test)]
     Kv,
     /// The revision metadata object store.
     Meta,

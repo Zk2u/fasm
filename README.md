@@ -280,7 +280,7 @@ commit boundary.
 | `fasm-storage-btreemap` | in-process, for tests and simulations | shared flat layout via `FlatEngine` | buffered transaction with rollback on drop | native tests and proptest |
 | `fasm-storage-redb` | native | shared flat layout via `FlatEngine` | file-backed, single writer, with commit on a dedicated thread | native tests |
 | `fasm-storage-fdb` | native | FoundationDB's native directory layer | FoundationDB cluster with optimistic transactions | CI against a live FDB 7.3 cluster behind the `fdb-storage-tests` feature |
-| `fasm-storage-indexeddb` | browser (`wasm32-unknown-unknown`) | the same flat layout, driven asynchronously because IndexedDB reads cannot use the synchronous `FlatEngine` | IndexedDB buffered session with one fenced readwrite commit and an optimistic revision fence | `wasm-pack test --headless --chrome\|--firefox` |
+| `fasm-storage-indexeddb` | browser (`wasm32-unknown-unknown`) | the shared `FlatEngine` over an owned snapshot | full snapshot per session or reader; buffered delta applied by one revision-fenced readwrite commit | `wasm-pack test --headless --chrome\|--firefox` |
 
 The `kv_store_tests!` and `kv_nav_tests!` conformance suites are the shared
 answer key for all four, run natively via `block_on` and in the browser via

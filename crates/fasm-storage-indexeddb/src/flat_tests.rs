@@ -1,10 +1,8 @@
-//! Browser tests for the asynchronous flat-directory driver.
+//! Browser integration tests for the shared directory engine over snapshots.
 
 use fasm_storage::{
-    KvDirNav, KvStore,
-    flatdir::{
-        COUNTER_KEY, LAYOUT_VERSION, ROOT_PREFIX, ROOT_PREFIX_KEY, VERSION_KEY, encode_varint,
-    },
+    KeyError, KvDirNav, KvStore,
+    flatdir::{LAYOUT_VERSION, VERSION_KEY, ops},
 };
 use wasm_bindgen::JsValue;
 use wasm_bindgen_test::wasm_bindgen_test;
@@ -65,11 +63,8 @@ async fn first_write_initialises_all_root_metadata() -> Result<(), IndexedDbErro
         session.raw_read(VERSION_KEY).await?,
         Some(LAYOUT_VERSION.to_vec())
     );
-    assert_eq!(
-        session.raw_read(ROOT_PREFIX_KEY).await?,
-        Some(ROOT_PREFIX.to_vec())
-    );
-    assert_eq!(session.raw_read(COUNTER_KEY).await?, Some(encode_varint(1)));
+    ops::validate(session.engine.raw()).expect("shared directory layout validates");
+    assert_eq!(session.get(&[], b"key").await?, Some(b"value".to_vec()));
 
     drop(session);
     drop(store);
@@ -80,7 +75,9 @@ async fn first_write_initialises_all_root_metadata() -> Result<(), IndexedDbErro
 async fn foreign_content_fails_reads_and_writes_closed() -> Result<(), IndexedDbError> {
     let name = unique_name("flat-foreign");
     let store = IndexedDbStore::open(&name).await?;
-    put_raw(&store, b"foreign", b"content").await?;
+    let mut version = LAYOUT_VERSION.to_vec();
+    version[..4].copy_from_slice(&2_u32.to_le_bytes());
+    put_raw(&store, VERSION_KEY, &version).await?;
     let mut session = store.transaction().await?;
 
     assert!(matches!(
@@ -141,9 +138,7 @@ async fn root_directory_is_not_removable() -> Result<(), IndexedDbError> {
 
     assert!(matches!(
         session.remove_dir(&[]).await,
-        Err(IndexedDbError::Key(
-            fasm_storage::KeyError::RootNotRemovable
-        ))
+        Err(IndexedDbError::Key(KeyError::RootNotRemovable))
     ));
 
     drop(session);
@@ -157,9 +152,7 @@ async fn non_utf8_directory_is_rejected_before_raw_io() -> Result<(), IndexedDbE
 
     assert!(matches!(
         session.set(&[&[0xff]], b"key", b"value").await,
-        Err(IndexedDbError::Key(
-            fasm_storage::KeyError::DirSegmentNotUtf8 { .. }
-        ))
+        Err(IndexedDbError::Key(KeyError::DirSegmentNotUtf8 { .. }))
     ));
     assert_eq!(session.pending_len(), 0);
     assert_eq!(session.raw_read(VERSION_KEY).await?, None);

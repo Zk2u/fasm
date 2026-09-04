@@ -18,7 +18,7 @@ use crate::{
         bytes_to_js, dom_error, fixture::await_complete, fixture::unique_name, fixture::wait_until,
         global_factory, revision_to_js,
     },
-    session::FaultInjection,
+    session::{FaultInjection, IndexedDbTransaction},
     store::{Scope, readonly_result},
 };
 
@@ -31,7 +31,10 @@ fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
     future.poll(&mut context)
 }
 
-async fn join2<F, G>(mut first: Pin<Box<F>>, mut second: Pin<Box<G>>) -> (F::Output, G::Output)
+pub(crate) async fn join2<F, G>(
+    mut first: Pin<Box<F>>,
+    mut second: Pin<Box<G>>,
+) -> (F::Output, G::Output)
 where
     F: Future,
     G: Future,
@@ -97,8 +100,12 @@ async fn revision(store: &IndexedDbStore) -> Result<Revision, IndexedDbError> {
     Ok(store.transaction().await?.expected_revision())
 }
 
-fn root_raw_key(key: &[u8]) -> Vec<u8> {
-    let mut raw = fasm_storage::flatdir::ROOT_PREFIX.to_vec();
+fn root_raw_key(session: &IndexedDbTransaction, key: &[u8]) -> Vec<u8> {
+    let mut raw = session
+        .engine
+        .prefix_of(&[])
+        .unwrap()
+        .expect("root was allocated");
     raw.extend_from_slice(key);
     raw
 }
@@ -127,7 +134,7 @@ async fn commit_persists_rows_revision_and_reopen() -> Result<(), IndexedDbError
     session.set(&[], b"b", b"vb").await?;
     session.commit().await?;
 
-    let reader = store.reader();
+    let reader = store.reader().await?;
     assert_eq!(reader.get(&[], b"a").await?, Some(b"va".to_vec()));
     assert_eq!(reader.get(&[], b"b").await?, Some(b"vb".to_vec()));
     assert_eq!(revision(&store).await?.get(), 1);
@@ -135,7 +142,7 @@ async fn commit_persists_rows_revision_and_reopen() -> Result<(), IndexedDbError
     drop(store);
 
     let reopened = IndexedDbStore::open(&name).await?;
-    let reader = reopened.reader();
+    let reader = reopened.reader().await?;
     assert_eq!(reader.get(&[], b"a").await?, Some(b"va".to_vec()));
     assert_eq!(reader.get(&[], b"b").await?, Some(b"vb".to_vec()));
     drop(reader);
@@ -151,7 +158,7 @@ async fn dropping_session_before_commit_rolls_back() -> Result<(), IndexedDbErro
     session.set(&[], b"k", b"v").await?;
     drop(session);
 
-    assert_eq!(store.reader().get(&[], b"k").await?, None);
+    assert_eq!(store.reader().await?.get(&[], b"k").await?, None);
     assert_eq!(revision(&store).await?, Revision::ZERO);
     drop(store);
     IndexedDbStore::delete(&name).await
@@ -167,7 +174,7 @@ async fn dropping_unpolled_commit_future_rolls_back() -> Result<(), IndexedDbErr
     let commit = session.commit();
     drop(commit);
 
-    assert_eq!(store.reader().get(&[], b"k").await?, None);
+    assert_eq!(store.reader().await?.get(&[], b"k").await?, None);
     assert_eq!(revision(&store).await?, Revision::ZERO);
     drop(store);
     IndexedDbStore::delete(&name).await
@@ -187,11 +194,14 @@ async fn dropping_polled_commit_future_still_commits() -> Result<(), IndexedDbEr
     let observed_store = store.clone();
     wait_until(2_000, move || {
         let store = observed_store.clone();
-        async move { Ok(store.reader().get(&[], b"k").await? == Some(b"v".to_vec())) }
+        async move { Ok(store.reader().await?.get(&[], b"k").await? == Some(b"v".to_vec())) }
     })
     .await?;
 
-    assert_eq!(store.reader().get(&[], b"k").await?, Some(b"v".to_vec()));
+    assert_eq!(
+        store.reader().await?.get(&[], b"k").await?,
+        Some(b"v".to_vec())
+    );
     assert_eq!(revision(&store).await?.get(), 1);
     drop(store);
     IndexedDbStore::delete(&name).await
@@ -209,7 +219,7 @@ async fn scoped_commit_forwards_to_indexeddb_session() -> Result<(), IndexedDbEr
     scoped.commit().await?;
 
     assert_eq!(
-        store.reader().get(&[b"scope"], b"a").await?,
+        store.reader().await?.get(&[b"scope"], b"a").await?,
         Some(b"v".to_vec())
     );
     drop(store);
@@ -235,8 +245,11 @@ async fn stale_session_conflicts_then_fresh_session_commits() -> Result<(), Inde
         })?;
     assert!(matches!(error, IndexedDbError::Conflict));
     assert!(error.is_retryable());
-    assert_eq!(store.reader().get(&[], b"x").await?, Some(b"vx".to_vec()));
-    assert_eq!(store.reader().get(&[], b"y").await?, None);
+    assert_eq!(
+        store.reader().await?.get(&[], b"x").await?,
+        Some(b"vx".to_vec())
+    );
+    assert_eq!(store.reader().await?.get(&[], b"y").await?, None);
     assert_eq!(revision(&store).await?.get(), 1);
 
     let mut fresh = store.transaction().await?;
@@ -330,7 +343,7 @@ async fn asynchronous_request_failure_rolls_back_every_write() -> Result<(), Ind
     session.set(&[], b"k", b"new").await?;
     session.set(&[], b"m", b"value").await?;
     session.inject_faults(FaultInjection {
-        fail_request_of: Some(root_raw_key(b"k")),
+        fail_request_of: Some(root_raw_key(&session, b"k")),
         ..FaultInjection::default()
     });
     let error = session
@@ -345,8 +358,11 @@ async fn asynchronous_request_failure_rolls_back_every_write() -> Result<(), Ind
         other => panic!("unexpected request failure: {other}"),
     }
     assert!(error.is_retryable());
-    assert_eq!(store.reader().get(&[], b"k").await?, Some(b"old".to_vec()));
-    assert_eq!(store.reader().get(&[], b"m").await?, None);
+    assert_eq!(
+        store.reader().await?.get(&[], b"k").await?,
+        Some(b"old".to_vec())
+    );
+    assert_eq!(store.reader().await?.get(&[], b"m").await?, None);
     assert_eq!(revision(&store).await?.get(), 1);
     drop(store);
     IndexedDbStore::delete(&name).await
@@ -360,7 +376,7 @@ async fn synchronous_enqueue_throw_aborts_without_writes() -> Result<(), Indexed
     session.set(&[], b"k", b"v").await?;
     session.set(&[], b"m", b"v").await?;
     session.inject_faults(FaultInjection {
-        fail_enqueue_of: Some(root_raw_key(b"k")),
+        fail_enqueue_of: Some(root_raw_key(&session, b"k")),
         ..FaultInjection::default()
     });
 
@@ -369,8 +385,8 @@ async fn synchronous_enqueue_throw_aborts_without_writes() -> Result<(), Indexed
         Err(error) => panic!("unexpected enqueue error: {error}"),
         Ok(()) => panic!("injected enqueue throw unexpectedly committed"),
     }
-    assert_eq!(store.reader().get(&[], b"k").await?, None);
-    assert_eq!(store.reader().get(&[], b"m").await?, None);
+    assert_eq!(store.reader().await?.get(&[], b"k").await?, None);
+    assert_eq!(store.reader().await?.get(&[], b"m").await?, None);
     assert_eq!(revision(&store).await?, Revision::ZERO);
     drop(store);
     IndexedDbStore::delete(&name).await
@@ -400,7 +416,7 @@ async fn failed_abort_after_conflict_still_returns_conflict() -> Result<(), Inde
         })?;
     assert!(matches!(error, IndexedDbError::Conflict));
     assert!(error.is_retryable());
-    assert_eq!(store.reader().get(&[], b"stale").await?, None);
+    assert_eq!(store.reader().await?.get(&[], b"stale").await?, None);
     assert_eq!(revision(&store).await?.get(), 1);
     drop(store);
     IndexedDbStore::delete(&name).await
@@ -413,7 +429,7 @@ async fn failed_abort_after_enqueue_throw_has_unknown_outcome() -> Result<(), In
     let mut session = store.transaction().await?;
     session.set(&[], b"k", b"v").await?;
     session.inject_faults(FaultInjection {
-        fail_enqueue_of: Some(root_raw_key(b"k")),
+        fail_enqueue_of: Some(root_raw_key(&session, b"k")),
         fail_abort: true,
         ..FaultInjection::default()
     });
@@ -430,7 +446,7 @@ async fn failed_abort_after_enqueue_throw_has_unknown_outcome() -> Result<(), In
         other => panic!("unexpected enqueue/abort failure: {other}"),
     }
     assert!(!error.is_retryable());
-    assert_eq!(store.reader().get(&[], b"k").await?, None);
+    assert_eq!(store.reader().await?.get(&[], b"k").await?, None);
     assert_eq!(revision(&store).await?, Revision::ZERO);
     drop(store);
     IndexedDbStore::delete(&name).await
@@ -443,8 +459,10 @@ async fn partial_enqueue_with_failed_abort_has_unknown_outcome() -> Result<(), I
     let mut session = store.transaction().await?;
     session.set(&[], b"a", b"written").await?;
     session.set(&[], b"k", b"not-written").await?;
+    let raw_a = root_raw_key(&session, b"a");
+    let raw_k = root_raw_key(&session, b"k");
     session.inject_faults(FaultInjection {
-        fail_enqueue_of: Some(root_raw_key(b"k")),
+        fail_enqueue_of: Some(root_raw_key(&session, b"k")),
         fail_abort: true,
         ..FaultInjection::default()
     });
@@ -461,15 +479,11 @@ async fn partial_enqueue_with_failed_abort_has_unknown_outcome() -> Result<(), I
         other => panic!("unexpected partial-enqueue/abort failure: {other}"),
     }
     assert!(!error.is_retryable());
-    assert_eq!(
-        raw_value(&store, &root_raw_key(b"a")).await?,
-        Some(b"written".to_vec())
-    );
-    assert_eq!(raw_value(&store, &root_raw_key(b"k")).await?, None);
-    assert!(matches!(
-        store.reader().get(&[], b"a").await,
-        Err(IndexedDbError::Foreign)
-    ));
+    assert_eq!(raw_value(&store, &raw_a).await?, Some(b"written".to_vec()));
+    assert_eq!(raw_value(&store, &raw_k).await?, None);
+    // The data key was queued before the layout metadata. PR 13 treats a
+    // missing version as fresh, so the orphan raw row is not visible via KvStore.
+    assert_eq!(store.reader().await?.get(&[], b"a").await?, None);
     assert_eq!(revision(&store).await?, Revision::ZERO);
     drop(store);
     IndexedDbStore::delete(&name).await
@@ -482,7 +496,7 @@ async fn conversion_failure_happens_before_transaction() -> Result<(), IndexedDb
     let mut session = store.transaction().await?;
     session.set(&[], b"k", b"v").await?;
     session.inject_faults(FaultInjection {
-        fail_conversion_of: Some(root_raw_key(b"k")),
+        fail_conversion_of: Some(root_raw_key(&session, b"k")),
         ..FaultInjection::default()
     });
 
@@ -491,7 +505,7 @@ async fn conversion_failure_happens_before_transaction() -> Result<(), IndexedDb
         Err(error) => panic!("unexpected conversion error: {error}"),
         Ok(()) => panic!("injected conversion failure unexpectedly committed"),
     }
-    assert_eq!(store.reader().get(&[], b"k").await?, None);
+    assert_eq!(store.reader().await?.get(&[], b"k").await?, None);
     assert_eq!(revision(&store).await?, Revision::ZERO);
     drop(store);
     IndexedDbStore::delete(&name).await
@@ -503,13 +517,18 @@ async fn corrupt_revision_aborts_instead_of_false_success() -> Result<(), Indexe
     let store = IndexedDbStore::open(&name).await?;
     let mut session = store.transaction().await?;
     session.set(&[], b"k", b"v").await?;
+    let raw_key = root_raw_key(&session, b"k");
     put_raw_meta(&store, &JsValue::from_str("x")).await?;
 
     assert!(matches!(
         session.commit().await,
         Err(IndexedDbError::Corrupt { .. })
     ));
-    assert_eq!(store.reader().get(&[], b"k").await?, None);
+    assert_eq!(raw_value(&store, &raw_key).await?, None);
+    assert!(matches!(
+        store.reader().await,
+        Err(IndexedDbError::Corrupt { .. })
+    ));
     drop(store);
     IndexedDbStore::delete(&name).await
 }
@@ -520,13 +539,18 @@ async fn missing_revision_record_aborts_commit() -> Result<(), IndexedDbError> {
     let store = IndexedDbStore::open(&name).await?;
     let mut session = store.transaction().await?;
     session.set(&[], b"k", b"v").await?;
+    let raw_key = root_raw_key(&session, b"k");
     delete_raw_meta(&store).await?;
 
     assert!(matches!(
         session.commit().await,
         Err(IndexedDbError::Corrupt { .. })
     ));
-    assert_eq!(store.reader().get(&[], b"k").await?, None);
+    assert_eq!(raw_value(&store, &raw_key).await?, None);
+    assert!(matches!(
+        store.reader().await,
+        Err(IndexedDbError::Corrupt { .. })
+    ));
     drop(store);
     IndexedDbStore::delete(&name).await
 }
@@ -608,7 +632,7 @@ async fn exhausted_revision_fails_before_opening_commit_transaction() -> Result<
         session.commit().await,
         Err(IndexedDbError::Corrupt { .. })
     ));
-    assert_eq!(store.reader().get(&[], b"k").await?, None);
+    assert_eq!(store.reader().await?.get(&[], b"k").await?, None);
     assert_eq!(revision(&store).await?, Revision::MAX);
     drop(store);
     IndexedDbStore::delete(&name).await

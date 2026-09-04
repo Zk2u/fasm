@@ -1,4 +1,4 @@
-//! Browser tests for paged committed cursors and buffered range overlays.
+//! Browser tests for snapshot ranges, mutations, and bounded traversal.
 
 use std::{collections::BTreeMap, ops::Bound};
 
@@ -12,7 +12,6 @@ use crate::{
     idb::{
         RequestFuture, dom_error, fixture::seed_root_rows, fixture::unique_name, global_factory,
     },
-    overlay::key_in_range,
 };
 
 fn from_js<T>(result: Result<T, JsValue>) -> Result<T, IndexedDbError> {
@@ -44,6 +43,18 @@ async fn seed_rows(
         .collect::<Vec<_>>();
     seed_root_rows(store, &rows).await?;
     Ok(oracle)
+}
+
+fn key_in_range(key: &[u8], start: Bound<&[u8]>, end: Bound<&[u8]>) -> bool {
+    (match start {
+        Bound::Unbounded => true,
+        Bound::Included(k) => key >= k,
+        Bound::Excluded(k) => key > k,
+    }) && (match end {
+        Bound::Unbounded => true,
+        Bound::Included(k) => key <= k,
+        Bound::Excluded(k) => key < k,
+    })
 }
 
 fn expected_range(
@@ -82,8 +93,7 @@ async fn raw_open(
 }
 
 #[wasm_bindgen_test]
-async fn mixed_overlay_crosses_committed_page_seams_in_both_directions()
--> Result<(), IndexedDbError> {
+async fn large_snapshot_ranges_merge_mutations_in_both_directions() -> Result<(), IndexedDbError> {
     let name = unique_name("scan-seams");
     let store = IndexedDbStore::open(&name).await?;
     let mut oracle = seed_rows(&store, 1_100).await?;
@@ -164,7 +174,7 @@ async fn mixed_overlay_crosses_committed_page_seams_in_both_directions()
 }
 
 #[wasm_bindgen_test]
-async fn all_tombstoned_pages_continue_to_visible_rows() -> Result<(), IndexedDbError> {
+async fn large_deleted_ranges_preserve_remaining_rows() -> Result<(), IndexedDbError> {
     let name = unique_name("scan-tombstoned-pages");
     let store = IndexedDbStore::open(&name).await?;
     let oracle = seed_rows(&store, 300).await?;
@@ -234,7 +244,7 @@ async fn reader_range_ignores_session_buffer_and_rejects_mutations() -> Result<(
         }]
     );
 
-    let mut reader = store.reader();
+    let mut reader = store.reader().await?;
     assert_eq!(
         reader
             .range(&[], Bound::Unbounded, Bound::Unbounded, false)
@@ -267,10 +277,10 @@ async fn reader_range_ignores_session_buffer_and_rejects_mutations() -> Result<(
 async fn closed_store_range_defers_failure_to_first_next() -> Result<(), IndexedDbError> {
     let name = unique_name("closed-range");
     let store = IndexedDbStore::open(&name).await?;
+    let reader = store.reader().await?;
     let factory = global_factory()?;
     let upgraded = raw_open(&factory, &name, 2).await?;
 
-    let reader = store.reader();
     let result = reader
         .range(&[], Bound::Unbounded, Bound::Unbounded, false)
         .next()

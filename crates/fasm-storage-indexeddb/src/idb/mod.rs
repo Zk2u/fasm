@@ -15,9 +15,10 @@ mod convert;
 mod detached;
 mod request;
 
-pub(crate) use convert::{
-    KeyRange, bytes_from_js, bytes_to_js, key_range, revision_from_js, revision_to_js,
-};
+#[cfg(test)]
+pub(crate) use convert::{KeyRange, key_range};
+
+pub(crate) use convert::{bytes_from_js, bytes_to_js, revision_from_js, revision_to_js};
 pub(crate) use detached::{DetachedId, detach, log_detached_failure, release};
 #[cfg(test)]
 pub(crate) use request::{CursorPage, factory_from};
@@ -29,8 +30,6 @@ pub(crate) use request::{
 pub(crate) const KV_STORE: &str = "kv";
 /// Object store containing backend bookkeeping records.
 pub(crate) const META_STORE: &str = "meta";
-/// Maximum number of committed rows driven by one cursor callback chain.
-pub(crate) const PAGE_SIZE: usize = 256;
 /// Key of the revision fence in the metadata object store.
 pub(crate) const REVISION_KEY: &str = "revision";
 /// IndexedDB schema version understood by this backend.

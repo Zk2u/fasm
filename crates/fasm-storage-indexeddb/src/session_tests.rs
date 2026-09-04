@@ -60,7 +60,7 @@ async fn session_reads_its_writes_without_changing_committed_data() -> Result<()
 
     assert_eq!(session.get(&[], b"k").await?, Some(b"v".to_vec()));
     assert!(session.exists(&[], b"k").await?);
-    assert_eq!(store.reader().get(&[], b"k").await?, None);
+    assert_eq!(store.reader().await?.get(&[], b"k").await?, None);
 
     drop(session);
     drop(store);
@@ -77,7 +77,10 @@ async fn tombstone_hides_committed_key_only_in_session() -> Result<(), IndexedDb
 
     assert_eq!(session.get(&[], b"k").await?, None);
     assert!(!session.exists(&[], b"k").await?);
-    assert_eq!(store.reader().get(&[], b"k").await?, Some(b"v".to_vec()));
+    assert_eq!(
+        store.reader().await?.get(&[], b"k").await?,
+        Some(b"v".to_vec())
+    );
 
     drop(session);
     drop(store);
@@ -91,7 +94,7 @@ async fn reader_sees_only_committed_data() -> Result<(), IndexedDbError> {
     seed_committed(&store, &[(&b"a"[..], &b"va"[..])]).await?;
     let mut session = store.transaction().await?;
     session.set(&[b"nested"], b"b", b"vb").await?;
-    let reader = store.reader();
+    let reader = store.reader().await?;
 
     assert_eq!(reader.get(&[], b"a").await?, Some(b"va".to_vec()));
     assert!(reader.exists(&[], b"a").await?);
@@ -246,10 +249,7 @@ async fn closed_store_rejects_sessions_and_reader_operations() -> Result<(), Ind
         store.transaction().await,
         Err(IndexedDbError::Closed)
     ));
-    assert!(matches!(
-        store.reader().get(&[], b"k").await,
-        Err(IndexedDbError::Closed)
-    ));
+    assert!(matches!(store.reader().await, Err(IndexedDbError::Closed)));
 
     upgraded.close();
     drop(store);

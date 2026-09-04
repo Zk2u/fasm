@@ -4,60 +4,57 @@
 //! keys. Its bytewise ordering of those rows preserves the caller's key order
 //! within one resolved directory.
 //!
-//! # Directories
+//! # Directories and snapshots
 //!
-//! Directories use the same `fasm_storage::flatdir` byte layout as the
-//! btreemap and redb backends: version, counter, root prefix, mapping rows, and
-//! directory-prefixed data rows are identical on disk. IndexedDB reads are
-//! asynchronous, so this crate drives those shared byte rules through its own
-//! async directory layer instead of the synchronous `FlatEngine`. The FDB
-//! backend is the other backend with a native directory-layer driver.
+//! The backend reuses [`fasm_storage::FlatEngine`] over an owned byte map.
+//! Directory metadata, the allocator, and data prefixes therefore use the same
+//! FoundationDB DirectoryLayer layout as btreemap and redb, without a second
+//! asynchronous implementation of those algorithms.
 //!
-//! # Buffered sessions
+//! `store.transaction().await?` reads all raw rows and the revision fence in
+//! **one readonly IndexedDB transaction** before returning a session. It keeps
+//! that snapshot in Rust and applies local writes to it synchronously. Reads
+//! and directory navigation remain stable across other tabs' commits, while
+//! observing the session's own pending writes. No browser transaction stays
+//! open across arbitrary application awaits.
 //!
-//! A session buffers writes in Rust as set values and tombstones. Reads overlay
-//! that buffer on short readonly IndexedDB transactions; commit applies the
-//! complete buffer in one readwrite transaction, and dropping an uncommitted
-//! session is a rollback. The buffering is necessary because IndexedDB
-//! transactions auto-commit when control returns to the event loop, while a
-//! state transition may await non-IndexedDB work before it is ready to commit.
-//! Holding one browser transaction across that work would therefore provide a
-//! misleading atomicity boundary.
+//! `store.reader().await?` also captures a full snapshot. All reads and scans
+//! through that handle stay on the captured state; acquire a new reader to see
+//! later commits. Closing the shared connection invalidates existing handles.
 //!
-//! Reads made at different times within a session are not one database
-//! snapshot. To make that weaker read model safe for writes, a `meta` object
-//! store holds a checked-u53 `revision`. A session remembers the revision it
-//! observed, then compares and increments it inside its commit transaction. A
-//! mismatch returns [`IndexedDbError::Conflict`], making the entire transition
-//! retryable. Concurrent sessions remain safe across tabs and workers: a
-//! session may observe a mixed view, but such a session can never commit after
-//! another writer moves the fence.
+//! # Commit and rollback
 //!
-//! Empty sessions still validate that fence, but write nothing and do not
-//! advance the revision. Non-empty commits request strict durability. Chrome
-//! honours that hint; other browsers may ignore it and use their default
-//! durability. A successful commit therefore means the transaction committed
-//! and, where the browser honours the hint, was flushed durably.
+//! A separate write buffer records changed keys and tombstones. Commit writes
+//! only this delta in one readwrite transaction over `kv` and `meta`; it never
+//! replaces the entire database. The revision captured with the snapshot must
+//! still match. Otherwise [`IndexedDbError::Conflict`] rejects the complete
+//! write set, including directory allocations, and the caller must retry from
+//! a fresh session. All writers must use this protocol: raw external writes
+//! that bypass the revision fence are unsupported.
 //!
-//! Once commit starts, dropping its Rust future does not cancel the IndexedDB
-//! transaction. The browser operation continues detached because abandoning
-//! the future cannot synchronously roll back work already submitted to
-//! IndexedDB.
+//! Empty sessions validate the fence without advancing it. Concurrent commits
+//! to unrelated directories also invalidate the session; the fence covers the
+//! whole named database. Dropping an uncommitted session discards its changes.
+//! Once a commit future has been polled, the browser operation is detached so
+//! dropping the future cannot leave partially queued work to auto-commit.
 //!
-//! # Range scans
+//! Write commits request strict durability. `Ok(())` confirms browser commit
+//! and, where the browser honours that hint, a durable flush. The existing
+//! error contract distinguishes retryable rollbacks from unknown outcomes.
 //!
-//! Range scans resolve one exact directory, then fetch at most 256 committed
-//! rows per page from that directory's data interval, using a fresh readonly
-//! transaction for every page. Each cursor window ends at its last
-//! committed seam key (or at the caller's terminal bound when exhausted), and
-//! buffered values and tombstones are merged only inside that window; a full
-//! page hidden entirely by tombstones advances to the next page rather than
-//! ending the stream.
+//! # Memory and range scans
 //!
-//! A reader handle uses a fresh readonly transaction for each page. Every page
-//! is internally consistent, but changes committed between pages can appear in
-//! or disappear from the overall scan. Callers that require a stable logical
-//! read must use their own revision or application-level validation.
+//! Opening each session or reader reads the **entire database**, including
+//! directory metadata, and holds its own copy until dropped. Capture also
+//! temporarily holds JavaScript cursor results before conversion into Rust.
+//! Memory and startup I/O therefore grow with total stored bytes, even for a
+//! single-key operation; this design targets bounded client state.
+//!
+//! Range scans materialize the selected rows from the in-memory snapshot in
+//! either direction, then expose them through [`fasm_storage::KvStream`].
+//! `take(n)` limits consumption, not the initial database read or range
+//! materialization. Scans perform no further IndexedDB I/O and cannot mix
+//! revisions between continuations.
 //!
 //! # Database identity
 //!
@@ -84,8 +81,6 @@
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod commit;
 mod error;
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-mod flat;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod idb;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -119,5 +114,7 @@ mod flat_tests;
 mod scan_tests;
 #[cfg(all(test, all(target_arch = "wasm32", target_os = "unknown")))]
 mod session_tests;
+#[cfg(all(test, all(target_arch = "wasm32", target_os = "unknown")))]
+mod snapshot_tests;
 #[cfg(all(test, all(target_arch = "wasm32", target_os = "unknown")))]
 mod store_tests;

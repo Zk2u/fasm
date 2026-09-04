@@ -6,8 +6,11 @@
 
 use std::{
     future::Future,
+    ops::Bound,
     sync::atomic::{AtomicU32, Ordering},
 };
+
+use fasm_storage::{FlatEngine, RawKv};
 
 use js_sys::{Function, Promise, Reflect};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
@@ -18,7 +21,12 @@ use super::{
     KV_STORE, RequestFuture, TransactionEnd, TransactionOutcome, bytes_to_js, dom_error,
     global_factory,
 };
-use crate::{IndexedDbError, IndexedDbStore, store::Scope};
+use crate::{
+    IndexedDbError, IndexedDbStore,
+    overlay::{Rows, Snapshot},
+    session::layout_error,
+    store::Scope,
+};
 
 static NEXT_DATABASE: AtomicU32 = AtomicU32::new(1);
 
@@ -46,34 +54,31 @@ pub(crate) fn unique_name(test_name: &str) -> String {
     format!("fasm-storage-indexeddb-{test_name}-{serial}")
 }
 
-/// Seeds committed root-directory rows in a valid flat-layout store.
-///
-/// Tests that bypass the public session surface must still stamp the exact
-/// layout metadata written by the directory driver. Otherwise any subsequent
-/// read correctly classifies their raw data as foreign.
+/// Builds real directory-layer rows through the shared engine.
+pub(crate) fn root_rows(rows: &[(&[u8], &[u8])]) -> Result<Rows, IndexedDbError> {
+    let mut engine = FlatEngine::new(Snapshot::new(Rows::new()));
+    for (key, value) in rows {
+        engine.set(&[], key, value).map_err(layout_error)?;
+    }
+    Ok(engine
+        .raw()
+        .scan(Bound::Unbounded, Bound::Unbounded, true)?
+        .into_iter()
+        .map(|pair| (pair.key, pair.value))
+        .collect())
+}
+
+/// Seeds raw rows without bumping the revision, for adapter fixtures only.
 pub(crate) async fn seed_root_rows(
     store: &IndexedDbStore,
     rows: &[(&[u8], &[u8])],
 ) -> Result<(), IndexedDbError> {
-    use fasm_storage::flatdir::{
-        COUNTER_KEY, LAYOUT_VERSION, ROOT_PREFIX, ROOT_PREFIX_KEY, VERSION_KEY, encode_varint,
-    };
-
+    let rows = root_rows(rows)?;
     let transaction = store.begin(IdbTransactionMode::Readwrite, Scope::Kv)?;
     let outcome = TransactionOutcome::new(transaction.clone());
     let object_store = from_js(transaction.object_store(KV_STORE))?;
-    let counter = encode_varint(1);
-    for (key, value) in [
-        (VERSION_KEY, LAYOUT_VERSION),
-        (ROOT_PREFIX_KEY, ROOT_PREFIX),
-        (COUNTER_KEY, counter.as_slice()),
-    ] {
-        from_js(object_store.put_with_key(&bytes_to_js(value), &bytes_to_js(key)))?;
-    }
     for (key, value) in rows {
-        let mut raw_key = ROOT_PREFIX.to_vec();
-        raw_key.extend_from_slice(key);
-        from_js(object_store.put_with_key(&bytes_to_js(value), &bytes_to_js(&raw_key)))?;
+        from_js(object_store.put_with_key(&bytes_to_js(&value), &bytes_to_js(&key)))?;
     }
     await_complete(outcome).await
 }

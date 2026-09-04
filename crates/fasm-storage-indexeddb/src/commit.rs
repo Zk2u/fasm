@@ -69,16 +69,18 @@ enum RequestedAbort {
 impl Commit for IndexedDbTransaction {
     type Error = IndexedDbError;
 
-    async fn commit(self) -> CommitResult {
-        if self.buffer.is_empty() {
+    async fn commit(mut self) -> CommitResult {
+        if self.engine.raw().buffer.is_empty() {
             return validate_empty_fence(&self.store, self.expected).await;
         }
         let next = self.expected.next()?;
 
+        let buffer = mem::take(&mut self.engine.raw_mut().buffer);
+        drop(self.engine);
         #[cfg(test)]
-        let prepared = prepare_ops(self.buffer, &self.faults)?;
+        let prepared = prepare_ops(buffer, &self.faults)?;
         #[cfg(not(test))]
-        let prepared = prepare_ops(self.buffer);
+        let prepared = prepare_ops(buffer);
 
         let transaction = self.store.begin_durable(Scope::KvAndMeta)?;
         CommitOperation::start(

@@ -54,9 +54,10 @@
 //! The trait and the plumbing live here; the concrete backends live in sibling
 //! crates: `fasm-storage-btreemap` (in-memory, tests and simulations only),
 //! `fasm-storage-redb`, `fasm-storage-fdb`, and `fasm-storage-indexeddb`
-//! (browser, `wasm32-unknown-unknown`). The IndexedDB backend buffers each
-//! session and applies it in one fenced readwrite commit using `?Send` browser
-//! futures. The conformance suite runs in the browser through its `test_attr`
+//! (browser, `wasm32-unknown-unknown`). The IndexedDB backend captures a full
+//! snapshot per session or reader, reuses `FlatEngine`, and applies each write
+//! buffer in one revision-fenced readwrite commit using `?Send` browser futures.
+//! The conformance suite runs in the browser through its `test_attr`
 //! arm. The target-aware portability markers preserve the native backends'
 //! thread-safety contract while allowing browser storage handles and futures.
 //!

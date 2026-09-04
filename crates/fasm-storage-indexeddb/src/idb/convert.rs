@@ -1,16 +1,21 @@
 //! Checked conversions between Rust storage types and IndexedDB values.
 
+#[cfg(test)]
 use std::ops::Bound;
 
+#[cfg(test)]
 use fasm_storage::is_empty_range;
 use js_sys::{ArrayBuffer, Uint8Array};
 use wasm_bindgen::{JsCast, JsValue};
+#[cfg(test)]
 use web_sys::IdbKeyRange;
 
+#[cfg(test)]
 use super::dom_error;
 use crate::{IndexedDbError, Revision};
 
 /// The IndexedDB cursor range corresponding to a Rust pair of bounds.
+#[cfg(test)]
 pub(crate) enum KeyRange {
     /// The bounds contain no key, so callers must not issue a cursor or delete.
     Empty,
@@ -57,6 +62,7 @@ pub(crate) fn bytes_from_js(value: &JsValue, what: &str) -> Result<Vec<u8>, Inde
 /// Empty and inverted ranges are identified before calling JavaScript because
 /// IndexedDB would throw `DataError` for some of them. In particular, the empty
 /// byte string remains a valid bound and is never treated as unbounded.
+#[cfg(test)]
 pub(crate) fn key_range(
     start: Bound<&[u8]>,
     end: Bound<&[u8]>,

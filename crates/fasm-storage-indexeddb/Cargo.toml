@@ -25,7 +25,7 @@ web-sys = { workspace = true, features = [
     "IdbTransactionMode",
     "IdbObjectStore",
     "IdbRequest",
-    # Ordered scans, pagination, and bounded key ranges.
+    # Full-snapshot cursors and raw-adapter test fixtures.
     "IdbCursor",
     "IdbCursorWithValue",
     "IdbCursorDirection",
@@ -43,7 +43,7 @@ wasm-bindgen-test.workspace = true
 fasm-storage = { workspace = true, features = ["test-utils"] }
 
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dev-dependencies]
-# Property tests for the native overlay implementation added in the next commit.
+# Property tests for the snapshot view and committed write delta.
 proptest.workspace = true
 
 [package.metadata.docs.rs]

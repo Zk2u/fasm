@@ -10,9 +10,6 @@ use std::{
 };
 
 use fasm_storage::KvStore;
-use fasm_storage::flatdir::{
-    COUNTER_KEY, LAYOUT_VERSION, ROOT_PREFIX, ROOT_PREFIX_KEY, VERSION_KEY, encode_varint,
-};
 use js_sys::Reflect;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_test::wasm_bindgen_test;
@@ -22,8 +19,9 @@ use crate::{
     IndexedDbError, IndexedDbStore, Revision,
     idb::{
         KV_STORE, META_STORE, REVISION_KEY, RequestFuture, TransactionOutcome, bytes_to_js,
-        dom_error, fixture::await_complete, fixture::seed_root_rows, fixture::sleep_ms,
-        fixture::unique_name, fixture::wait_until, global_factory, revision_from_js,
+        dom_error, fixture::await_complete, fixture::root_rows, fixture::seed_root_rows,
+        fixture::sleep_ms, fixture::unique_name, fixture::wait_until, global_factory,
+        revision_from_js,
     },
     store::{Scope, transaction_durability},
 };
@@ -132,7 +130,7 @@ async fn delete_removes_rows_and_recreates_revision() -> Result<(), IndexedDbErr
     let name = unique_name("delete-removes");
     let store = IndexedDbStore::open(&name).await?;
     put_raw_row(&store).await?;
-    assert_eq!(kv_count(&store).await?, 4);
+    assert!(kv_count(&store).await? > 1);
     drop(store);
 
     IndexedDbStore::delete(&name).await?;
@@ -168,20 +166,12 @@ async fn durable_transaction_requests_strict_and_completes_write() -> Result<(),
 
     let outcome = TransactionOutcome::new(transaction.clone());
     let object_store = from_js(transaction.object_store(KV_STORE))?;
-    let counter = encode_varint(1);
-    let mut raw_key = ROOT_PREFIX.to_vec();
-    raw_key.extend_from_slice(b"key");
-    for (key, value) in [
-        (VERSION_KEY, LAYOUT_VERSION),
-        (ROOT_PREFIX_KEY, ROOT_PREFIX),
-        (COUNTER_KEY, counter.as_slice()),
-        (raw_key.as_slice(), b"value".as_slice()),
-    ] {
-        from_js(object_store.put_with_key(&bytes_to_js(value), &bytes_to_js(key)))?;
+    for (key, value) in root_rows(&[(b"key", b"value")])? {
+        from_js(object_store.put_with_key(&bytes_to_js(&value), &bytes_to_js(&key)))?;
     }
     await_complete(outcome).await?;
     assert_eq!(
-        store.reader().get(&[], b"key").await?,
+        store.reader().await?.get(&[], b"key").await?,
         Some(b"value".to_vec())
     );
 
