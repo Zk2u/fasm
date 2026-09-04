@@ -359,12 +359,23 @@ fn native_storage_contract_remains_send_and_sync() {
     fn assert_send<T: Send>(_value: T) {}
     fn assert_send_sync<T: Send + Sync>() {}
 
+    fn spawnable<S: KvStore + Sync>(store: &S) {
+        assert_send(store.get(&[], b"k"));
+        assert_send(store.range(&[], Bound::Unbounded, Bound::Unbounded, false));
+    }
+
+    fn nav_spawnable<S: KvDirNav + Sync>(store: &S) {
+        assert_send(store.list_dirs(&[]));
+    }
+
     assert_send(NativeCommit.commit());
     assert_send(KvStream::<'static, TestErr>::new(async { Ok(None) }));
     assert_send_sync::<NativeStore>();
+    spawnable(&NativeStore);
+    nav_spawnable(&NativeStore);
 
-    // Native `async fn` traits are not dyn-compatible, so the contract is
-    // asserted on the concrete store rather than `Box<dyn KvStore>`.
+    // Return-position futures in traits are not dyn-compatible, so the
+    // contract is asserted generically rather than through `Box<dyn KvStore>`.
 }
 
 #[test]

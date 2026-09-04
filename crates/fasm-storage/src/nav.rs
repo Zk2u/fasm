@@ -2,6 +2,7 @@
 
 use core::future::Future;
 
+use crate::maybe_send::MaybeSend;
 use crate::store::KvStore;
 
 /// Directory navigation over a [`KvStore`].
@@ -14,8 +15,8 @@ use crate::store::KvStore;
 ///
 /// All three methods validate their directory path with
 /// [`validate_dir`](crate::validate_dir) before touching the engine.
-// See `KvStore`: auto-trait bounds are carried by the supertraits' markers.
-#[allow(async_fn_in_trait)]
+/// Their futures follow [`KvStore`]'s portability rule: they are `Send` on
+/// native targets and may remain thread-local on browser wasm.
 pub trait KvDirNav: KvStore {
     /// List the immediate child directory names under `dir`, as segment
     /// bytes, sorted ascending.
@@ -24,7 +25,10 @@ pub trait KvDirNav: KvStore {
     /// [`dir_exists`](crate::nav::KvDirNav::dir_exists) is how to tell "no children"
     /// from "not there". Output is sorted at this boundary so the ordering
     /// is deterministic regardless of the engine's.
-    fn list_dirs(&self, dir: &[&[u8]]) -> impl Future<Output = Result<Vec<Vec<u8>>, Self::Error>>;
+    fn list_dirs(
+        &self,
+        dir: &[&[u8]],
+    ) -> impl Future<Output = Result<Vec<Vec<u8>>, Self::Error>> + MaybeSend;
 
     /// Whether the directory exists.
     ///
@@ -33,7 +37,10 @@ pub trait KvDirNav: KvStore {
     /// exists); the root exists iff the store's anchor node exists, so a
     /// fresh, never-written store's root does not; on FDB the layer's
     /// mapping entry is present.
-    fn dir_exists(&self, dir: &[&[u8]]) -> impl Future<Output = Result<bool, Self::Error>>;
+    fn dir_exists(
+        &self,
+        dir: &[&[u8]],
+    ) -> impl Future<Output = Result<bool, Self::Error>> + MaybeSend;
 
     /// Remove `dir` **recursively**: its subdirectories (child rows and
     /// data) and all of `dir`'s own key data.
@@ -44,5 +51,8 @@ pub trait KvDirNav: KvStore {
     /// `[]` is not removable — [`KeyError::RootNotRemovable`](crate::KeyError::RootNotRemovable).
     ///
     /// The whole removal is one transaction on transactional backends.
-    fn remove_dir(&mut self, dir: &[&[u8]]) -> impl Future<Output = Result<bool, Self::Error>>;
+    fn remove_dir(
+        &mut self,
+        dir: &[&[u8]],
+    ) -> impl Future<Output = Result<bool, Self::Error>> + MaybeSend;
 }

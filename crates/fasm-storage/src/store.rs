@@ -11,13 +11,13 @@ use crate::stream::KvStream;
 /// Async ordered key-value store, scoped by directory.
 ///
 /// This trait abstracts over in-memory maps and the near-term backend targets,
-/// redb and FoundationDB. [`MaybeSend`] and [`MaybeSync`] preserve the native
-/// `Send + Sync` contract while allowing browser storage handles to hold
-/// `JsValue`s, which are `!Send`. The browser exception deliberately targets
-/// only `wasm32-unknown-unknown`, rather than `target_family = "wasm"`, because
-/// targets such as `wasm32-wasip1-threads` have real threads. Every operation
-/// is async so that network-backed and transactional engines fit without a
-/// blocking shim.
+/// redb and FoundationDB. Store types and method futures use [`MaybeSend`]
+/// (and store types also use [`MaybeSync`]): these mean `Send`/`Sync` on native
+/// targets but impose no thread-safety requirement in a browser, where storage
+/// handles may hold `JsValue`s. The browser exception deliberately targets only
+/// `wasm32-unknown-unknown`, rather than `target_family = "wasm"`, because targets
+/// such as `wasm32-wasip1-threads` have real threads. Every operation is async so
+/// that network-backed and transactional engines fit without a blocking shim.
 ///
 /// # Directories and keys
 ///
@@ -91,11 +91,14 @@ use crate::stream::KvStream;
 /// distinguish "the transaction conflicted, rerun the transition" from "this
 /// data is corrupt, fail closed".
 ///
-/// # Why `Send + Sync`
+/// # Why `Sync`
 ///
-/// Handles are `Send + Sync` on native targets so sessions can move between
-/// tasks. The portability markers relax those bounds in the browser, where
-/// storage handles remain thread-local.
+/// Every method future is explicitly [`MaybeSend`]: it is `Send` on native
+/// targets, so a generic caller can move (for example) `store.get(..)` across a
+/// task boundary when `S: KvStore + Sync`. In a browser the marker does not
+/// require `Send`, allowing both the store and its futures to remain
+/// thread-local. [`MaybeSync`] supplies the native `Sync` requirement needed by
+/// futures that capture `&Self`.
 pub trait KvStore: MaybeSend + MaybeSync {
     /// The error type for this store.
     type Error: Error + RetryableStorageError + MaybeSend + MaybeSync + 'static;
@@ -108,7 +111,7 @@ pub trait KvStore: MaybeSend + MaybeSync {
         &self,
         dir: &[&[u8]],
         key: &[u8],
-    ) -> impl Future<Output = Result<Option<Vec<u8>>, Self::Error>>;
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, Self::Error>> + MaybeSend;
 
     /// Set a key-value pair in a directory, overwriting any existing value
     /// for the key. The directory (and any missing ancestor) is allocated
@@ -118,7 +121,7 @@ pub trait KvStore: MaybeSend + MaybeSync {
         dir: &[&[u8]],
         key: &[u8],
         value: &[u8],
-    ) -> impl Future<Output = Result<(), Self::Error>>;
+    ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
 
     /// Delete a key from a directory.
     ///
@@ -128,15 +131,19 @@ pub trait KvStore: MaybeSend + MaybeSync {
         &mut self,
         dir: &[&[u8]],
         key: &[u8],
-    ) -> impl Future<Output = Result<(), Self::Error>>;
+    ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
 
     /// Check whether a key exists in a directory.
     ///
     /// The default implementation goes through [`get`](KvStore::get) and
     /// therefore pays for transferring the value. Backends with a cheaper
     /// existence probe should override it.
-    fn exists(&self, dir: &[&[u8]], key: &[u8]) -> impl Future<Output = Result<bool, Self::Error>> {
-        async move { self.get(dir, key).await.map(|v| v.is_some()) }
+    fn exists(
+        &self,
+        dir: &[&[u8]],
+        key: &[u8],
+    ) -> impl Future<Output = Result<bool, Self::Error>> + MaybeSend {
+        async move { Ok(self.get(dir, key).await?.is_some()) }
     }
 
     /// Scan the keys of one directory between two key bounds, in
@@ -203,5 +210,5 @@ pub trait KvStore: MaybeSend + MaybeSync {
         dir: &[&[u8]],
         start: Bound<&[u8]>,
         end: Bound<&[u8]>,
-    ) -> impl Future<Output = Result<(), Self::Error>>;
+    ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
 }
