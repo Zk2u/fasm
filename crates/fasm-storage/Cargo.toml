@@ -8,8 +8,10 @@ publish.workspace = true
 description = "Ordered async byte-oriented key-value storage: the KvStore/Commit traits and the Storage Scoping adapter shared by FASM state machines and their storage backends"
 
 [dependencies]
-async-trait.workspace = true
 thiserror.workspace = true
+# The HCA candidate source: pinned to the same major the foundationdb
+# crate already pulls in transitively (it declares rand 0.10).
+rand = "0.10"
 
 [dev-dependencies]
 # Note: this crate deliberately has no dependency on a backend crate (that
