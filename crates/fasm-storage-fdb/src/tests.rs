@@ -390,6 +390,9 @@ fn the_committed_layout_validates_over_the_raw_handle() {
     let begin = KeySelector::first_greater_or_equal(&[] as &[u8]);
     let end = KeySelector::first_greater_or_equal(&[0xFFu8]);
     let mut opt = RangeOption::from((begin, end));
+    // Force multiple pages so validation cannot silently inspect only
+    // the first batch. A row is returned even when it exceeds this cap.
+    opt.target_bytes = 1;
     let mut iteration = 1;
     let mut rows: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
     block_on(async {
@@ -410,6 +413,7 @@ fn the_committed_layout_validates_over_the_raw_handle() {
                 None => break,
             }
         }
+        assert!(iteration > 1, "the raw scan must exercise pagination");
     });
     fasm_storage::flatdir::ops::validate(&DumpRawKv(rows))
         .expect("the committed layout must validate");
