@@ -2,18 +2,16 @@
 //! [`ScopedKvStore`](fasm_storage::ScopedKvStore) adapter built on it.
 //!
 //! This backend is **transactional**. [`BTreeMapStore`] is the committed base
-//! and the opener; every test's store handle is a fresh
+//! (raw layout rows) and the opener; every test's store handle is a fresh
 //! [`BTreeMapTransaction`] whose buffered writes are read-your-writes, are
 //! applied to the base with [`Commit`], and roll back on drop. The state
 //! machines built on `fasm-storage` rely on exactly that contract, so the
 //! conformance suite runs against the transaction handle: an in-memory test
 //! and a durable-backend test exercise the same semantics.
 //!
-//! The suite covers the conformance tests, the scoped-store behaviour, the
-//! fail-closed tests, and the keyspace/scoped property tests: this crate
-//! holds the in-process store the whole workspace is tested against. The two
-//! scan helpers are named `scan_bounded` and `scan_all` so their call sites
-//! stay unambiguous.
+//! The suite covers the conformance tests, the scoped-store behaviour, and
+//! the transaction/reference-model property tests: this crate holds the
+//! in-process store the whole workspace is tested against.
 //!
 //! `fasm-storage` keeps its pure-logic tests and deliberately has no
 //! dependency on this crate: a dev-dependency cycle would make `KvStore`
@@ -25,17 +23,73 @@ use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 use std::collections::BTreeMap;
 
-use async_trait::async_trait;
 use proptest::prelude::*;
 use proptest::test_runner::Config as ProptestConfig;
-use thiserror::Error;
 
 use fasm_storage::{
-    Commit, KvPair, KvStore, KvStream, RetryableStorageError, ScopedKvError, ScopedKvStore,
-    bound_as_slice,
+    Commit, FlatError, KvDirNav, KvPair, KvStore, RawKv, RetryableStorageError, ScopedKvStore,
+    bound_as_slice, flatdir,
 };
 
-use crate::{BTreeMapError, BTreeMapStore, BTreeMapTransaction};
+use crate::{BTreeMapError, BTreeMapStore, BTreeMapTransaction, BufViewError};
+
+/// A read-only [`RawKv`] view over an owned raw-row map, for running the
+/// layout's `validate` against a dumped table.
+struct MapRawKv(BTreeMap<Vec<u8>, Vec<u8>>);
+
+impl MapRawKv {
+    fn bounds_hit(bound: Bound<&[u8]>, k: &[u8]) -> bool {
+        match bound {
+            Bound::Unbounded => true,
+            Bound::Included(x) => k >= x,
+            Bound::Excluded(x) => k < x,
+        }
+    }
+}
+
+impl RawKv for MapRawKv {
+    type Error = fasm_storage::FlatError<core::convert::Infallible>;
+
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(self.0.get(key).cloned())
+    }
+
+    fn scan(
+        &self,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+        forward: bool,
+    ) -> Result<Vec<KvPair>, Self::Error> {
+        let rows = self
+            .0
+            .iter()
+            .filter(|(k, _)| {
+                Self::bounds_hit(start, k.as_slice()) && Self::bounds_hit(end, k.as_slice())
+            })
+            .map(|(k, v)| KvPair {
+                key: k.clone(),
+                value: v.clone(),
+            })
+            .collect::<Vec<_>>();
+        Ok(if forward {
+            rows
+        } else {
+            rows.into_iter().rev().collect()
+        })
+    }
+
+    fn insert(&mut self, _key: &[u8], _value: &[u8]) -> Result<(), Self::Error> {
+        unreachable!("validate is read-only")
+    }
+
+    fn delete(&mut self, _key: &[u8]) -> Result<(), Self::Error> {
+        unreachable!("validate is read-only")
+    }
+
+    fn clear_range(&mut self, _start: Bound<&[u8]>, _end: Bound<&[u8]>) -> Result<(), Self::Error> {
+        unreachable!("validate is read-only")
+    }
+}
 
 // ============================================================================
 // Shared test support
@@ -109,6 +163,23 @@ fn arb_value() -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(any::<u8>(), 0..4)
 }
 
+/// Arbitrary directory segments: short UTF-8 names so that generated
+/// directories stay tiny and can be compared. The alphabet is ASCII (a
+/// subset of UTF-8): the trait contract rejects non-UTF-8 segments, so the
+/// model never generates one.
+fn arb_seg() -> impl Strategy<Value = Vec<u8>> {
+    prop::collection::vec(0x61u8..=0x63u8, 1..3).prop_map(|bytes| {
+        String::from_utf8(bytes)
+            .expect("ASCII is UTF-8")
+            .into_bytes()
+    })
+}
+
+/// Arbitrary directory paths: 0..2 segments.
+fn arb_dir() -> impl Strategy<Value = Vec<Vec<u8>>> {
+    prop::collection::vec(arb_seg(), 0..2)
+}
+
 /// Arbitrary range bounds, including inverted and equal endpoints.
 ///
 /// The reference model naturally selects no keys for an inverted interval, so
@@ -147,10 +218,14 @@ fn bounds_contain(bounds: &(Bound<Vec<u8>>, Bound<Vec<u8>>), key: &[u8]) -> bool
     above_start && below_end
 }
 
-/// Collect a full scan of `store` as `(key, value)` pairs.
-async fn scan_all<KV: KvStore>(store: &KV, reverse: bool) -> Vec<(Vec<u8>, Vec<u8>)> {
+/// Collect a full scan of `dir` as `(key, value)` pairs.
+async fn scan_all<KV: KvStore>(
+    store: &KV,
+    dir: &[&[u8]],
+    reverse: bool,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
     store
-        .range(Bound::Unbounded, Bound::Unbounded, reverse)
+        .range(dir, Bound::Unbounded, Bound::Unbounded, reverse)
         .collect()
         .await
         .expect("scan must succeed")
@@ -159,14 +234,16 @@ async fn scan_all<KV: KvStore>(store: &KV, reverse: bool) -> Vec<(Vec<u8>, Vec<u
         .collect()
 }
 
-/// Collect a bounded range scan as `(key, value)` pairs.
+/// Collect a bounded range scan within `dir` as `(key, value)` pairs.
 async fn scan_bounded<KV: KvStore>(
     store: &KV,
+    dir: &[&[u8]],
     bounds: &(Bound<Vec<u8>>, Bound<Vec<u8>>),
     reverse: bool,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
     store
         .range(
+            dir,
             bound_as_slice(&bounds.0),
             bound_as_slice(&bounds.1),
             reverse,
@@ -180,7 +257,7 @@ async fn scan_bounded<KV: KvStore>(
 }
 
 // ============================================================================
-// Conformance: the four scopes the suite must pass
+// Conformance: the scopes the suite must pass
 // ============================================================================
 
 mod btreemap_conformance {
@@ -190,34 +267,48 @@ mod btreemap_conformance {
         store = super::open_transaction(),
         block_on = super::block_on,
     );
+    // Its caller-space root is the engine root, so navigation conformance
+    // applies too.
+    fasm_storage::kv_nav_tests!(
+        store = super::open_transaction(),
+        block_on = super::block_on,
+    );
 }
 
 mod scoped_conformance {
     use fasm_storage::ScopedKvStore;
 
     fasm_storage::kv_store_tests!(
-        store = ScopedKvStore::new(super::open_store().transaction(), b"c1/swap/".to_vec()),
+        store = ScopedKvStore::new(
+            super::open_transaction(),
+            vec![b"a".to_vec(), b"b".to_vec()]
+        ),
         block_on = super::block_on,
     );
 }
 
-mod scoped_all_ff_conformance {
+mod scoped_deep_conformance {
     use fasm_storage::ScopedKvStore;
 
-    // The prefix with no successor: `end_bound(Unbounded)` must degrade to
-    // `Bound::Unbounded` or every high key falls out of the namespace.
     fasm_storage::kv_store_tests!(
-        store = ScopedKvStore::new(super::open_store().transaction(), vec![0xFF, 0xFF]),
+        store = ScopedKvStore::new(
+            super::open_transaction(),
+            vec![b"x".to_vec(), b"y".to_vec(), b"z".to_vec()]
+        ),
         block_on = super::block_on,
     );
 }
 
-mod empty_prefix_conformance {
+mod root_pinned_conformance {
     use fasm_storage::ScopedKvStore;
 
-    // The other successor-less prefix: an empty scope is a transparent view.
+    // An empty pin is a transparent view of the whole store, root and all.
     fasm_storage::kv_store_tests!(
-        store = ScopedKvStore::new(super::open_store().transaction(), Vec::new()),
+        store = ScopedKvStore::new(super::open_transaction(), Vec::new()),
+        block_on = super::block_on,
+    );
+    fasm_storage::kv_nav_tests!(
+        store = ScopedKvStore::new(super::open_transaction(), Vec::new()),
         block_on = super::block_on,
     );
 }
@@ -227,27 +318,150 @@ mod empty_prefix_conformance {
 // ============================================================================
 
 #[test]
-fn btreemap_store_reports_committed_size_and_raw_keys() {
+fn btreemap_store_reports_committed_rows_and_raw_keys() {
     block_on(async {
         let store = open_store();
         assert!(store.is_empty());
         assert_eq!(store.len(), 0);
 
         let mut tx = store.transaction();
-        tx.set(b"b", b"2").await.expect("set b");
-        tx.set(b"a", b"1").await.expect("set a");
+        tx.set(&[b"a"], b"k", b"v").await.expect("set k");
         // Uncommitted: the base still reports nothing.
         assert!(store.is_empty());
-        assert_eq!(store.keys().len(), 0);
+        assert_eq!(store.len(), 0);
 
         tx.commit().await.expect("commit");
+        // One data key in one directory materialises the lazily written
+        // layout: version row, anchor child + layer rows, the directory
+        // child + layer rows, HCA counter + two recent rows, and the data
+        // row.
         assert!(!store.is_empty());
-        assert_eq!(store.len(), 2);
-        assert_eq!(store.keys(), vec![b"a".to_vec(), b"b".to_vec()]);
-        assert_eq!(store.get_committed(b"a"), Some(b"1".to_vec()));
+        assert_eq!(store.len(), 9);
+        let rows = raw_map(&store);
+        assert_eq!(
+            flatdir::parse_version(
+                rows.get(flatdir::VERSION_KEY)
+                    .expect("version row")
+                    .as_slice()
+            ),
+            Some((1, 0, 0))
+        );
+        // The anchor's child row is the reserved first element under the
+        // root node.
+        let anchor_child =
+            flatdir::layout::child_key(flatdir::layout::ROOT_NODE, flatdir::ROOT_PATH_SEGMENT);
+        assert!(rows.contains_key(&anchor_child), "anchor child row missing");
+        // The committed raw map holds exactly one data value.
+        let keys = store.keys();
+        let data_rows: Vec<&Vec<u8>> = keys
+            .iter()
+            .filter(|k| (0x0c..=0x1c).contains(&k.first().copied().unwrap_or(0xFF)))
+            .collect();
+        assert_eq!(data_rows.len(), 1);
+        assert_eq!(
+            store.get_committed(data_rows[0].as_slice()),
+            Some(b"v".to_vec())
+        );
+        // The layout is self-consistent.
+        flatdir::ops::validate(&MapRawKv(rows)).expect("the layout must validate");
+
+        // A second directory with one data row adds exactly four rows:
+        // the child row, the layer row, the data row, and the HCA recent
+        // row for the new allocation.
+        let mut tx2 = store.transaction();
+        tx2.set(&[b"b"], b"k2", b"v2").await.expect("set b");
+        tx2.commit().await.expect("commit b");
+        assert_eq!(store.len(), 13);
 
         store.clear();
         assert!(store.is_empty());
+    });
+}
+
+/// The reference operation sequence for the deterministic-layout test: a
+/// mixed write/delete/clear pattern across the root and two nested
+/// directories.
+async fn run_reference_ops(tx: &mut BTreeMapTransaction) {
+    tx.set(&[], b"k", b"v1").await.expect("set k");
+    tx.set(&[b"a"], b"x", b"y").await.expect("set x");
+    tx.set(&[b"a", b"b"], b"m", b"n").await.expect("set m");
+    tx.delete(&[], b"k").await.expect("delete k");
+    tx.set(&[b"a"], b"x", b"y2").await.expect("set x2");
+    tx.clear_range(&[b"a"], Bound::Unbounded, Bound::Unbounded)
+        .await
+        .expect("clear a");
+}
+
+fn raw_map(store: &BTreeMapStore) -> std::collections::BTreeMap<Vec<u8>, Vec<u8>> {
+    store
+        .keys()
+        .into_iter()
+        .map(|k| (k.clone(), store.get_committed(&k).expect("committed row")))
+        .collect()
+}
+
+#[test]
+fn the_version_entry_is_1_0_0_after_any_write() {
+    block_on(async {
+        let store = open_store();
+        let mut tx = store.transaction();
+        tx.set(&[b"swap"], b"k", b"v").await.expect("set");
+        tx.commit().await.expect("commit");
+        let rows = raw_map(&store);
+        assert_eq!(
+            flatdir::parse_version(
+                rows.get(flatdir::VERSION_KEY)
+                    .expect("version row")
+                    .as_slice()
+            ),
+            Some((1, 0, 0))
+        );
+    });
+}
+
+#[test]
+fn the_same_operations_resolve_the_same_paths_and_validate() {
+    block_on(async {
+        let s1 = open_store();
+        let s2 = open_store();
+        let mut t1 = s1.transaction();
+        let mut t2 = s2.transaction();
+        run_reference_ops(&mut t1).await;
+        run_reference_ops(&mut t2).await;
+        t1.commit().await.expect("commit 1");
+        t2.commit().await.expect("commit 2");
+
+        // The HCA samples its candidate within the window (the verbatim
+        // FDB contention-distribution design), so the two stores' raw
+        // layouts are not byte-identical. What is guaranteed: the same
+        // visible data, and a self-consistent layout on both.
+        for s in [&s1, &s2] {
+            let rows = raw_map(s);
+            // The reference ops' end state is a deterministic 12-row
+            // layout: the version row, the HCA counter row, one child
+            // row and one layer row per directory (the harness root
+            // segment, `a`, and `a.b`), one HCA recent row per
+            // allocation (three in total), and the one surviving data
+            // row.
+            assert_eq!(rows.len(), 12, "unexpected raw rows: {rows:?}");
+            flatdir::ops::validate(&MapRawKv(rows)).expect("the layout must validate");
+        }
+        let r1 = s1.transaction();
+        let r2 = s2.transaction();
+        // The reference ops deleted the root's only key.
+        assert_eq!(r1.get(&[], b"k").await.unwrap(), None);
+        assert_eq!(r2.get(&[], b"k").await.unwrap(), None);
+        // And cleared directory `[a]`'s keys; `[a, b]` survives with `m`.
+        assert_eq!(r1.get(&[b"a"], b"x").await.unwrap(), None);
+        assert_eq!(
+            r1.get(&[b"a", b"b"], b"m").await.unwrap(),
+            Some(b"n".to_vec())
+        );
+        assert_eq!(r2.get(&[b"a"], b"x").await.unwrap(), None);
+        assert_eq!(
+            r2.get(&[b"a", b"b"], b"m").await.unwrap(),
+            Some(b"n".to_vec())
+        );
     });
 }
 
@@ -259,14 +473,17 @@ fn a_transaction_sees_its_own_uncommitted_writes() {
         let store = open_store();
         let mut tx = store.transaction();
 
-        tx.set(b"new", b"n").await.expect("set new");
-        assert_eq!(tx.get(b"new").await.expect("get new"), Some(b"n".to_vec()));
+        tx.set(&[b"a"], b"k", b"n").await.expect("set k");
+        assert_eq!(
+            tx.get(&[b"a"], b"k").await.expect("get k"),
+            Some(b"n".to_vec())
+        );
         // Not visible in the committed base.
-        assert_eq!(store.get_committed(b"new"), None);
+        assert_eq!(store.len(), 0);
 
         // A fresh transaction sees only the committed base.
         let other = store.transaction();
-        assert_eq!(other.get(b"new").await.expect("get other"), None);
+        assert_eq!(other.get(&[b"a"], b"k").await.expect("get other"), None);
     });
 }
 
@@ -278,19 +495,21 @@ fn a_transaction_delete_shadows_the_committed_value() {
         let store = open_store();
         {
             let mut seed = store.transaction();
-            seed.set(b"k", b"old").await.expect("seed");
+            seed.set(&[b"a"], b"k", b"old").await.expect("seed");
             seed.commit().await.expect("seed commit");
         }
 
         let mut tx = store.transaction();
-        tx.delete(b"k").await.expect("delete");
-        assert_eq!(tx.get(b"k").await.expect("get"), None);
-        assert!(!tx.exists(b"k").await.expect("exists"));
+        tx.delete(&[b"a"], b"k").await.expect("delete");
+        assert_eq!(tx.get(&[b"a"], b"k").await.expect("get"), None);
+        assert!(!tx.exists(&[b"a"], b"k").await.expect("exists"));
         // The committed value is untouched until the commit applies.
-        assert_eq!(store.get_committed(b"k"), Some(b"old".to_vec()));
+        assert_eq!(store.len(), 9);
 
         tx.commit().await.expect("commit");
-        assert_eq!(store.get_committed(b"k"), None);
+        // The data row is gone; the layout rows and the (empty) directory
+        // remain.
+        assert_eq!(store.len(), 8);
     });
 }
 
@@ -302,23 +521,25 @@ fn an_uncommitted_transaction_rolls_back_on_drop() {
         let store = open_store();
         {
             let mut seed = store.transaction();
-            seed.set(b"seed", b"kept").await.expect("seed");
+            seed.set(&[b"a"], b"k", b"kept").await.expect("seed");
             seed.commit().await.expect("seed commit");
         }
 
         {
             let mut ephemeral = store.transaction();
-            ephemeral.set(b"ephemeral", b"gone").await.expect("set");
-            ephemeral.delete(b"seed").await.expect("delete");
-            // Dropping the transaction without a commit discards both writes.
+            ephemeral.set(&[b"a"], b"k", b"gone").await.expect("set");
+            ephemeral.set(&[b"b"], b"k2", b"new").await.expect("set b");
+            ephemeral.remove_dir(&[b"a"]).await.expect("remove a");
+            // Dropping the transaction without a commit discards all of it.
         }
 
+        assert_eq!(store.len(), 9, "the committed base must be untouched");
+        let check = store.transaction();
         assert_eq!(
-            store.get_committed(b"seed"),
-            Some(b"kept".to_vec()),
-            "the committed seed must survive the rolled-back delete"
+            check.get(&[b"a"], b"k").await.expect("get"),
+            Some(b"kept".to_vec())
         );
-        assert_eq!(store.get_committed(b"ephemeral"), None);
+        assert_eq!(check.get(&[b"b"], b"k2").await.expect("get"), None);
     });
 }
 
@@ -331,19 +552,19 @@ fn a_range_scan_merges_buffered_writes_over_the_committed_map() {
         let store = open_store();
         {
             let mut seed = store.transaction();
-            for key in [b"a", b"b", b"c", b"d"] {
-                seed.set(key, b"committed").await.expect("seed");
+            for key in [&b"a"[..], &b"b"[..], &b"c"[..], &b"d"[..]] {
+                seed.set(&[], key, b"committed").await.expect("seed");
             }
             seed.commit().await.expect("seed commit");
         }
 
         let mut tx = store.transaction();
-        tx.set(b"b", b"overridden").await.expect("override b");
-        tx.set(b"e", b"new").await.expect("add e");
-        tx.delete(b"c").await.expect("delete c");
+        tx.set(&[], b"b", b"overridden").await.expect("override b");
+        tx.set(&[], b"e", b"new").await.expect("add e");
+        tx.delete(&[], b"c").await.expect("delete c");
 
         let unbounded = (Bound::Unbounded, Bound::Unbounded);
-        let pairs = scan_bounded(&tx, &unbounded, false).await;
+        let pairs = scan_bounded(&tx, &[], &unbounded, false).await;
         assert_eq!(
             pairs,
             vec![
@@ -355,71 +576,44 @@ fn a_range_scan_merges_buffered_writes_over_the_committed_map() {
         );
 
         // The same set, descending.
-        let reversed = scan_bounded(&tx, &unbounded, true).await;
+        let reversed = scan_bounded(&tx, &[], &unbounded, true).await;
         assert_eq!(reversed.into_iter().rev().collect::<Vec<_>>(), pairs);
     });
 }
 
 #[test]
-fn btreemap_error_is_not_retryable() {
-    assert!(!BTreeMapError.is_retryable());
+fn btreemap_errors_are_not_retryable() {
+    let key_err = fasm_storage::KeyError::RootNotRemovable;
+    for e in &[
+        BTreeMapError::from(FlatError::Foreign),
+        BTreeMapError::from(FlatError::Corrupt),
+        BTreeMapError::from(FlatError::Key(key_err)),
+        BTreeMapError::from(FlatError::Engine(BufViewError)),
+    ] {
+        assert!(!e.is_retryable());
+    }
 }
 
 #[test]
-fn debug_output_redacts_stored_keys_values_and_prefixes() {
+fn debug_output_redacts_stored_keys_and_values() {
     block_on(async {
         let store = open_store();
         let mut tx = store.transaction();
-        tx.set(b"secret-key", b"secret-value").await.expect("set");
-        assert_eq!(format!("{tx:?}"), "BTreeMapTransaction { pending: 1 }");
+        tx.set(&[b"a"], b"secret-key", b"secret-value")
+            .await
+            .expect("set");
+        // One set in one directory lazily initialises the layout (version
+        // row, anchor + directory child rows, anchor + directory layer
+        // rows, HCA counter + two recent rows) and writes the data row:
+        // nine buffered raw rows.
+        assert_eq!(format!("{tx:?}"), "BTreeMapTransaction { pending: 9 }");
         // Nothing is committed yet, and the base count never shows the bytes.
-        assert_eq!(format!("{store:?}"), "BTreeMapStore { keys: 0 }");
+        assert_eq!(format!("{store:?}"), "BTreeMapStore { rows: 0 }");
         tx.commit().await.expect("commit");
-        assert_eq!(format!("{store:?}"), "BTreeMapStore { keys: 1 }");
+        assert_eq!(format!("{store:?}"), "BTreeMapStore { rows: 9 }");
 
-        let pair = KvPair {
-            key: b"secret-key".to_vec(),
-            value: b"secret-value".to_vec(),
-        };
-        assert_eq!(
-            format!("{pair:?}"),
-            "KvPair { key: <elided>, value: <12 bytes> }"
-        );
-
-        let scoped = ScopedKvStore::new(store.transaction(), b"secret-prefix/".to_vec());
-        assert_eq!(format!("{scoped:?}"), "ScopedKvStore(..)");
-
-        // The one error that is handed a key from *another* namespace. It is
-        // what a retry loop logs, so neither the foreign key nor this scope's
-        // own prefix may survive into `Display` or `Debug`.
-        let violation: ScopedKvError<BTreeMapError> =
-            ScopedKvError::prefix_violation(b"secret-prefix/", b"foreign/secret-key");
-        for rendered in [format!("{violation}"), format!("{violation:?}")] {
-            assert!(
-                !rendered.contains("secret-key") && !rendered.contains("secret-prefix"),
-                "key material must not reach the error text: {rendered}"
-            );
-            assert!(
-                !rendered.contains("foreign"),
-                "the foreign namespace must not reach the error text: {rendered}"
-            );
-        }
-
-        // Lengths still make the report actionable.
-        let message = format!("{violation}");
-        assert!(message.contains("18-byte key"), "{message}");
-        assert!(message.contains("14-byte prefix"), "{message}");
-
-        // The fingerprints are stable, so two reports of the same violation
-        // correlate, and distinct keys do not collide into one report.
-        assert_eq!(
-            ScopedKvError::<BTreeMapError>::prefix_violation(b"p/", b"foreign/a"),
-            ScopedKvError::<BTreeMapError>::prefix_violation(b"p/", b"foreign/a"),
-        );
-        assert_ne!(
-            ScopedKvError::<BTreeMapError>::prefix_violation(b"p/", b"foreign/a"),
-            ScopedKvError::<BTreeMapError>::prefix_violation(b"p/", b"foreign/b"),
-        );
+        let scoped = ScopedKvStore::new(store.transaction(), vec![b"a".to_vec()]);
+        assert_eq!(format!("{scoped:?}"), "ScopedKvStore { dir_segments: 1 }");
     });
 }
 
@@ -427,40 +621,49 @@ fn debug_output_redacts_stored_keys_values_and_prefixes() {
 // BTreeMapTransaction as a reference model
 // ============================================================================
 
+/// The reference model: a map from `(dir, key)` to value with the semantics
+/// the [`KvStore`] documentation describes.
+type Model = BTreeMap<(Vec<Vec<u8>>, Vec<u8>), Vec<u8>>;
+
 /// One mutation applied to both the transaction and the reference model.
 #[derive(Debug, Clone)]
 enum Op {
     /// Write a value, overwriting any existing one.
-    Set(Vec<u8>, Vec<u8>),
+    Set(Vec<Vec<u8>>, Vec<u8>, Vec<u8>),
     /// Remove a key, present or not.
-    Delete(Vec<u8>),
-    /// Remove every key in a range.
-    ClearRange(Bound<Vec<u8>>, Bound<Vec<u8>>),
+    Delete(Vec<Vec<u8>>, Vec<u8>),
+    /// Remove every key in a range within one directory.
+    ClearRange(Vec<Vec<u8>>, Bound<Vec<u8>>, Bound<Vec<u8>>),
 }
 
 /// Arbitrary mutation. `set` is weighted up so sequences actually accumulate
 /// state instead of thrashing an almost-empty map.
 fn arb_op() -> impl Strategy<Value = Op> {
     prop_oneof![
-        4 => (arb_key(), arb_value()).prop_map(|(key, value)| Op::Set(key, value)),
-        2 => arb_key().prop_map(Op::Delete),
-        1 => arb_bounds().prop_map(|(start, end)| Op::ClearRange(start, end)),
+        4 => (arb_dir(), arb_key(), arb_value()).prop_map(|(dir, key, value)| Op::Set(dir, key, value)),
+        2 => (arb_dir(), arb_key()).prop_map(|(dir, key)| Op::Delete(dir, key)),
+        1 => (arb_dir(), arb_bounds())
+            .prop_map(|(dir, bounds)| Op::ClearRange(dir, bounds.0, bounds.1)),
     ]
 }
 
-/// Apply `op` to the reference model: a plain `BTreeMap` with the semantics
-/// the [`KvStore`] documentation describes, written out directly.
-fn apply_to_model(model: &mut BTreeMap<Vec<u8>, Vec<u8>>, op: &Op) {
+fn dir_slice(dir: &[Vec<u8>]) -> Vec<&[u8]> {
+    dir.iter().map(|s| s.as_slice()).collect()
+}
+
+/// Apply `op` to the reference model.
+fn apply_to_model(model: &mut Model, op: &Op) {
     match op {
-        Op::Set(key, value) => {
-            model.insert(key.clone(), value.clone());
+        Op::Set(dir, key, value) => {
+            model.insert((dir.clone(), key.clone()), value.clone());
         }
-        Op::Delete(key) => {
-            model.remove(key);
+        Op::Delete(dir, key) => {
+            model.remove(&(dir.clone(), key.clone()));
         }
-        Op::ClearRange(start, end) => {
+        Op::ClearRange(dir, start, end) => {
             let bounds = (start.clone(), end.clone());
-            model.retain(|key, _| !bounds_contain(&bounds, key));
+            let d = dir.clone();
+            model.retain(|(d2, key), _| !(d2 == &d && bounds_contain(&bounds, key)));
         }
     }
 }
@@ -468,98 +671,51 @@ fn apply_to_model(model: &mut BTreeMap<Vec<u8>, Vec<u8>>, op: &Op) {
 /// Apply `op` to the transaction under test.
 async fn apply_to_store(tx: &mut BTreeMapTransaction, op: &Op) {
     match op {
-        Op::Set(key, value) => tx.set(key, value).await.expect("set must succeed"),
-        Op::Delete(key) => tx.delete(key).await.expect("delete must succeed"),
-        Op::ClearRange(start, end) => tx
-            .clear_range(bound_as_slice(start), bound_as_slice(end))
-            .await
-            .expect("clear_range must succeed"),
+        Op::Set(dir, key, value) => {
+            tx.set(&dir_slice(dir), key, value)
+                .await
+                .expect("set must succeed");
+        }
+        Op::Delete(dir, key) => {
+            tx.delete(&dir_slice(dir), key)
+                .await
+                .expect("delete must succeed");
+        }
+        Op::ClearRange(dir, start, end) => {
+            tx.clear_range(&dir_slice(dir), bound_as_slice(start), bound_as_slice(end))
+                .await
+                .expect("clear_range must succeed");
+        }
     }
 }
 
-#[test]
-fn invalid_btree_ranges_are_empty_in_both_directions() {
-    block_on(async {
-        let mut tx = open_transaction();
-        tx.set(b"k", b"value").await.expect("set must succeed");
-
-        for (start, end) in [
-            (
-                Bound::Excluded(b"k".as_slice()),
-                Bound::Excluded(b"k".as_slice()),
-            ),
-            (
-                Bound::Included(b"z".as_slice()),
-                Bound::Excluded(b"a".as_slice()),
-            ),
-            (
-                Bound::Excluded(b"z".as_slice()),
-                Bound::Included(b"a".as_slice()),
-            ),
-        ] {
-            for reverse in [false, true] {
-                let pairs = tx
-                    .range(start, end, reverse)
-                    .collect()
-                    .await
-                    .expect("scan must succeed");
-                assert!(
-                    pairs.is_empty(),
-                    "bounds {start:?}..{end:?}, reverse={reverse}"
-                );
-            }
-        }
-    });
-}
-
-#[test]
-fn invalid_btree_clear_ranges_are_noops() {
-    block_on(async {
-        for (start, end) in [
-            (
-                Bound::Excluded(b"k".as_slice()),
-                Bound::Excluded(b"k".as_slice()),
-            ),
-            (
-                Bound::Included(b"z".as_slice()),
-                Bound::Excluded(b"a".as_slice()),
-            ),
-            (
-                Bound::Excluded(b"z".as_slice()),
-                Bound::Included(b"a".as_slice()),
-            ),
-        ] {
-            let mut tx = open_transaction();
-            tx.set(b"k", b"value").await.expect("set must succeed");
-            tx.clear_range(start, end)
-                .await
-                .expect("clear_range must succeed");
-
-            assert_eq!(
-                tx.get(b"k").await.expect("get must succeed"),
-                Some(b"value".to_vec()),
-                "bounds {start:?}..{end:?}",
-            );
-        }
-    });
+/// Scan the model's one directory as `(key, value)` pairs.
+fn model_dir_pairs(model: &Model, dir: &[Vec<u8>]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let d = dir.to_vec();
+    model
+        .iter()
+        .filter(|((d2, _), _)| d2 == &d)
+        .map(|((_, key), value)| (key.clone(), value.clone()))
+        .collect()
 }
 
 proptest! {
-    // Each case replays a whole op sequence and then runs four scans.
+    // Each case replays a whole op sequence and then runs scans.
     #![proptest_config(ProptestConfig::with_cases(64))]
 
     /// A `BTreeMapTransaction` buffers every write, so its merged view must
-    /// agree with a plain `BTreeMap` model op for op. Everything built on this
-    /// crate is tested against this store, which makes any divergence from the
-    /// obvious model a divergence the layers above would inherit.
+    /// agree with the `(dir, key) -> value` model op for op. Everything built
+    /// on this crate is tested against this store, which makes any divergence
+    /// from the obvious model a divergence the layers above would inherit.
     #[test]
-    fn prop_btreemap_transaction_tracks_a_btreemap_model(
+    fn prop_btreemap_transaction_tracks_a_model(
         ops in prop::collection::vec(arb_op(), 0..24),
+        query_dir in arb_dir(),
         query in arb_bounds(),
     ) {
         block_on(async {
             let mut tx = open_transaction();
-            let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+            let mut model: Model = Model::new();
 
             for op in &ops {
                 apply_to_store(&mut tx, op).await;
@@ -567,39 +723,48 @@ proptest! {
 
                 // Point reads agree after every single step, so a
                 // divergence is reported at the op that caused it.
-                if let Op::Set(key, _) | Op::Delete(key) = op {
-                    let stored = tx.get(key).await.expect("get must succeed");
-                    prop_assert_eq!(stored.as_ref(), model.get(key));
+                if let Op::Set(dir, key, _) | Op::Delete(dir, key) = op {
+                    let stored = tx.get(&dir_slice(dir), key).await.expect("get must succeed");
+                    let want = model.get(&(dir.clone(), key.clone())).cloned();
+                    prop_assert_eq!(stored, want.clone());
                     prop_assert_eq!(
-                        tx.exists(key).await.expect("exists must succeed"),
-                        model.contains_key(key),
+                        tx.exists(&dir_slice(dir), key).await.expect("exists must succeed"),
+                        want.is_some(),
                     );
                 }
             }
 
-            let everything: Vec<(Vec<u8>, Vec<u8>)> = model
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect();
+            // The full directory scan agrees in both directions.
+            let everything = model_dir_pairs(&model, &query_dir);
             let unbounded = (Bound::Unbounded, Bound::Unbounded);
-
-            prop_assert_eq!(scan_bounded(&tx, &unbounded, false).await, everything.clone());
-
+            prop_assert_eq!(
+                scan_bounded(&tx, &dir_slice(&query_dir), &unbounded, false).await,
+                everything.clone(),
+            );
             let mut descending = everything.clone();
             descending.reverse();
-            prop_assert_eq!(scan_bounded(&tx, &unbounded, true).await, descending);
+            prop_assert_eq!(
+                scan_bounded(&tx, &dir_slice(&query_dir), &unbounded, true).await,
+                descending,
+            );
 
             // ...and an arbitrary bounded query selects exactly the model's
             // keys inside those bounds, in both directions.
+            let bounds = (query.0.clone(), query.1.clone());
             let selected: Vec<(Vec<u8>, Vec<u8>)> = everything
                 .into_iter()
-                .filter(|(key, _)| bounds_contain(&query, key))
+                .filter(|(key, _)| bounds_contain(&bounds, key))
                 .collect();
-            prop_assert_eq!(scan_bounded(&tx, &query, false).await, selected.clone());
-
+            prop_assert_eq!(
+                scan_bounded(&tx, &dir_slice(&query_dir), &bounds, false).await,
+                selected.clone(),
+            );
             let mut selected_descending = selected;
             selected_descending.reverse();
-            prop_assert_eq!(scan_bounded(&tx, &query, true).await, selected_descending);
+            prop_assert_eq!(
+                scan_bounded(&tx, &dir_slice(&query_dir), &bounds, true).await,
+                selected_descending,
+            );
 
             Ok(())
         })?;
@@ -611,20 +776,43 @@ proptest! {
 // ============================================================================
 
 #[test]
-fn scoped_store_prefixes_the_backing_keys() {
+fn scoped_store_pins_the_directory() {
     block_on(async {
         let store = open_store();
-        let mut scope = ScopedKvStore::new(store.transaction(), b"p/".to_vec());
-        assert_eq!(scope.prefix(), b"p/");
+        let mut scope =
+            ScopedKvStore::new(store.transaction(), vec![b"c1".to_vec(), b"swap".to_vec()]);
+        assert_eq!(scope.dir(), &[b"c1".to_vec(), b"swap".to_vec()]);
 
-        scope.set(b"key", b"value").await.expect("set");
-        scope.set(b"", b"root").await.expect("set empty key");
+        scope.set(&[], b"key", b"value").await.expect("set");
+        scope.set(&[], b"", b"root").await.expect("set empty key");
 
         // Commit, then inspect the committed base through the opener.
         scope.commit().await.expect("commit must not fail");
-        assert_eq!(store.keys(), vec![b"p/".to_vec(), b"p/key".to_vec()]);
-        assert_eq!(store.get_committed(b"p/key"), Some(b"value".to_vec()));
-        assert_eq!(store.get_committed(b"p/"), Some(b"root".to_vec()));
+        // The pin directory's own empty key and `key` land in the pin, and
+        // nothing else: the layout rows plus the pin's two data rows.
+        let check = store.transaction();
+        assert_eq!(
+            check.get(&[b"c1", b"swap"], b"key").await.expect("get key"),
+            Some(b"value".to_vec())
+        );
+        assert_eq!(
+            check
+                .get(&[b"c1", b"swap"], b"")
+                .await
+                .expect("get empty key"),
+            Some(b"root".to_vec())
+        );
+        // The pin's parent directory exists (allocated on the way) but holds
+        // no keys of its own.
+        let visible: Vec<Vec<u8>> = check
+            .range(&[b"c1"], Bound::Unbounded, Bound::Unbounded, false)
+            .collect()
+            .await
+            .expect("scan parent")
+            .into_iter()
+            .map(|pair| pair.key)
+            .collect();
+        assert!(visible.is_empty(), "the parent holds no data of its own");
     });
 }
 
@@ -632,27 +820,30 @@ fn scoped_store_prefixes_the_backing_keys() {
 fn scoped_stores_do_not_see_each_others_keys() {
     block_on(async {
         let store = open_store();
-        let mut first = ScopedKvStore::new(store.transaction(), vec![0x10]);
-        first.set(b"key", b"first").await.expect("set first");
+        let mut first = ScopedKvStore::new(store.transaction(), vec![b"a".to_vec()]);
+        first.set(&[], b"key", b"first").await.expect("set first");
         first
-            .set(b"other", b"first-other")
+            .set(&[], b"other", b"first-other")
             .await
             .expect("set first other");
         first.commit().await.expect("commit first");
 
-        let mut second = ScopedKvStore::new(store.transaction(), vec![0x20]);
-        second.set(b"key", b"second").await.expect("set second");
+        let mut second = ScopedKvStore::new(store.transaction(), vec![b"b".to_vec()]);
+        second
+            .set(&[], b"key", b"second")
+            .await
+            .expect("set second");
         second.commit().await.expect("commit second");
 
-        // Same caller-space key, different namespaces, no collision. A fresh
-        // scoped handle reads the committed write through the namespace.
-        let second = ScopedKvStore::new(store.transaction(), vec![0x20]);
+        // Same caller-space key, different directories, no collision. A fresh
+        // scoped handle reads the committed write through its pin.
+        let second = ScopedKvStore::new(store.transaction(), vec![b"b".to_vec()]);
         assert_eq!(
-            second.get(b"key").await.expect("get second"),
+            second.get(&[], b"key").await.expect("get second"),
             Some(b"second".to_vec())
         );
         let visible: Vec<Vec<u8>> = second
-            .range(Bound::Unbounded, Bound::Unbounded, false)
+            .range(&[], Bound::Unbounded, Bound::Unbounded, false)
             .collect()
             .await
             .expect("scan second")
@@ -661,80 +852,76 @@ fn scoped_stores_do_not_see_each_others_keys() {
             .collect();
         assert_eq!(visible, vec![b"key".to_vec()]);
 
-        let mut back = ScopedKvStore::new(store.transaction(), vec![0x10]);
+        let mut back = ScopedKvStore::new(store.transaction(), vec![b"a".to_vec()]);
         assert_eq!(
-            back.get(b"key").await.expect("get first"),
+            back.get(&[], b"key").await.expect("get first"),
             Some(b"first".to_vec())
         );
 
-        // Clearing one namespace wholesale leaves the other intact.
-        back.clear_range(Bound::Unbounded, Bound::Unbounded)
+        // Clearing one directory wholesale leaves the other intact.
+        back.clear_range(&[], Bound::Unbounded, Bound::Unbounded)
             .await
             .expect("clear first");
         back.commit().await.expect("commit first clear");
 
-        assert_eq!(store.keys(), vec![[0x20, b'k', b'e', b'y'].to_vec()]);
+        // The base still holds the second scope's key.
+        let check = store.transaction();
+        assert_eq!(
+            check.get(&[b"b"], b"key").await.expect("get"),
+            Some(b"second".to_vec())
+        );
+        assert_eq!(check.get(&[b"a"], b"key").await.expect("get"), None);
     });
 }
 
 #[test]
-fn scoped_range_bounds_never_leak_past_the_namespace() {
+fn scoped_relative_paths_name_subdirectories_of_the_pin() {
     block_on(async {
-        // Neighbouring prefixes chosen so a missing upper bound would spill:
-        // `[0x10, 0xFF]`'s successor is `[0x11]`, and `[0x11]` is populated.
         let store = open_store();
-        {
-            let mut seed = store.transaction();
-            for key in [
-                [0x10, 0xFE].as_slice(),
-                [0x10, 0xFF].as_slice(),
-                [0x10, 0xFF, 0x00].as_slice(),
-                [0x10, 0xFF, 0xFF].as_slice(),
-                [0x11].as_slice(),
-                [0x11, 0x00].as_slice(),
-            ] {
-                seed.set(key, b"v").await.expect("seed");
-            }
-            seed.commit().await.expect("seed commit");
-        }
+        let mut scope = ScopedKvStore::new(store.transaction(), vec![b"a".to_vec()]);
 
-        let mut scope = ScopedKvStore::new(store.transaction(), vec![0x10, 0xFF]);
-        let keys: Vec<Vec<u8>> = scope
-            .range(Bound::Unbounded, Bound::Unbounded, false)
+        // The empty relative path names the pin itself.
+        scope.set(&[], b"top", b"t").await.expect("set at pin");
+        // A relative path names a subdirectory of the pin.
+        scope.set(&[b"sub"], b"k", b"v").await.expect("set in sub");
+
+        scope.commit().await.expect("commit");
+
+        let check = store.transaction();
+        assert_eq!(
+            check.get(&[b"a"], b"top").await.expect("pin key"),
+            Some(b"t".to_vec())
+        );
+        assert_eq!(
+            check.get(&[b"a", b"sub"], b"k").await.expect("sub key"),
+            Some(b"v".to_vec())
+        );
+        // A scan at the pin's level never yields the subdirectory's keys.
+        let visible: Vec<Vec<u8>> = check
+            .range(&[b"a"], Bound::Unbounded, Bound::Unbounded, false)
             .collect()
             .await
-            .expect("scan")
+            .expect("scan pin")
             .into_iter()
             .map(|pair| pair.key)
             .collect();
-        assert_eq!(keys, vec![Vec::new(), vec![0x00], vec![0xFF]]);
-
-        // ...and the same holds for a range delete.
-        scope
-            .clear_range(Bound::Unbounded, Bound::Unbounded)
-            .await
-            .expect("clear");
-        scope.commit().await.expect("commit clear");
-
-        assert_eq!(
-            store.keys(),
-            vec![vec![0x10, 0xFE], vec![0x11], vec![0x11, 0x00],]
-        );
+        assert_eq!(visible, vec![b"top".to_vec()]);
     });
 }
 
 #[test]
-fn scoped_nesting_concatenates_prefixes() {
+fn scoped_nesting_appends_one_segment() {
     block_on(async {
         let store = open_store();
-        let mut nested = ScopedKvStore::new(store.transaction(), b"c1/".to_vec()).scoped(b"swap/");
-        assert_eq!(nested.prefix(), b"c1/swap/");
+        let mut nested =
+            ScopedKvStore::new(store.transaction(), vec![b"c1".to_vec()]).nested(b"swap");
+        assert_eq!(nested.dir(), &[b"c1".to_vec(), b"swap".to_vec()]);
 
-        nested.set(b"status", b"funded").await.expect("set");
+        nested.set(&[], b"status", b"funded").await.expect("set");
         assert_eq!(
             nested
                 .inner()
-                .get(b"c1/swap/status")
+                .get(&[b"c1", b"swap"], b"status")
                 .await
                 .expect("raw get"),
             Some(b"funded".to_vec())
@@ -742,190 +929,20 @@ fn scoped_nesting_concatenates_prefixes() {
 
         nested
             .inner_mut()
-            .clear_range(Bound::Unbounded, Bound::Unbounded)
+            .clear_range(&[b"c1", b"swap"], Bound::Unbounded, Bound::Unbounded)
             .await
-            .expect("clear inner");
-        assert_eq!(nested.get(b"status").await.expect("get"), None);
+            .expect("clear the pin");
+        assert_eq!(nested.get(&[], b"status").await.expect("get"), None);
     });
 }
 
 #[test]
 fn scoped_commit_forwards_unwrapped() {
     block_on(async {
-        let scope = ScopedKvStore::new(open_store().transaction(), b"p/".to_vec());
-        // The commit error type is the backend's own, not `ScopedKvError`.
+        let scope = ScopedKvStore::new(open_transaction(), vec![b"p".to_vec()]);
+        // The commit error type is the backend's own.
         let result: Result<(), BTreeMapError> = scope.commit().await;
         result.expect("commit must not fail");
-    });
-}
-
-// ============================================================================
-// Fail-closed behaviour
-// ============================================================================
-
-/// Error type for [`RogueStore`], deliberately reported as retryable so the
-/// forwarding in [`ScopedKvError::is_retryable`] is observable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-#[error("rogue backend error")]
-struct RogueError;
-
-impl RetryableStorageError for RogueError {
-    fn is_retryable(&self) -> bool {
-        true
-    }
-}
-
-/// A backend that ignores range bounds and fails every point read.
-///
-/// A correct backend can never trigger [`ScopedKvError::PrefixViolation`],
-/// because [`ScopedKvStore`] confines every bound it hands down. This store
-/// exists to prove the scoped wrapper fails closed anyway rather than trusting
-/// what comes back.
-struct RogueStore;
-
-#[async_trait]
-impl KvStore for RogueStore {
-    type Error = RogueError;
-
-    async fn get(&self, _key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-        Err(RogueError)
-    }
-
-    async fn set(&mut self, _key: &[u8], _value: &[u8]) -> Result<(), Self::Error> {
-        Err(RogueError)
-    }
-
-    async fn delete(&mut self, _key: &[u8]) -> Result<(), Self::Error> {
-        Err(RogueError)
-    }
-
-    fn range<'a>(
-        &'a self,
-        _start: Bound<&[u8]>,
-        _end: Bound<&[u8]>,
-        _reverse: bool,
-    ) -> KvStream<'a, Self::Error> {
-        KvStream::new(async {
-            let pair = KvPair {
-                key: b"somewhere/else".to_vec(),
-                value: b"not yours".to_vec(),
-            };
-            Ok(Some((pair, KvStream::empty())))
-        })
-    }
-
-    async fn clear_range(
-        &mut self,
-        _start: Bound<&[u8]>,
-        _end: Bound<&[u8]>,
-    ) -> Result<(), Self::Error> {
-        Err(RogueError)
-    }
-}
-
-/// A backend that delegates reads and writes but ignores clear-range bounds.
-struct OverDeletingStore {
-    inner: BTreeMapTransaction,
-}
-
-#[async_trait]
-impl KvStore for OverDeletingStore {
-    type Error = BTreeMapError;
-
-    async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-        self.inner.get(key).await
-    }
-
-    async fn set(&mut self, key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
-        self.inner.set(key, value).await
-    }
-
-    async fn delete(&mut self, key: &[u8]) -> Result<(), Self::Error> {
-        self.inner.delete(key).await
-    }
-
-    async fn exists(&self, key: &[u8]) -> Result<bool, Self::Error> {
-        self.inner.exists(key).await
-    }
-
-    fn range<'a>(
-        &'a self,
-        start: Bound<&[u8]>,
-        end: Bound<&[u8]>,
-        reverse: bool,
-    ) -> KvStream<'a, Self::Error> {
-        self.inner.range(start, end, reverse)
-    }
-
-    /// The rogue behaviour: ignore the scoped bounds and clear everything.
-    async fn clear_range(
-        &mut self,
-        _start: Bound<&[u8]>,
-        _end: Bound<&[u8]>,
-    ) -> Result<(), Self::Error> {
-        self.inner
-            .clear_range(Bound::Unbounded, Bound::Unbounded)
-            .await
-    }
-}
-
-#[test]
-fn scoped_scan_rejects_keys_outside_its_prefix() {
-    block_on(async {
-        let scope = ScopedKvStore::new(RogueStore, b"p/".to_vec());
-        let err = scope
-            .range(Bound::Unbounded, Bound::Unbounded, false)
-            .collect()
-            .await
-            .expect_err("out-of-prefix key must not be returned to the caller");
-
-        assert_eq!(
-            err,
-            ScopedKvError::prefix_violation(b"p/", b"somewhere/else")
-        );
-        assert!(!err.is_retryable(), "corruption must not look retryable");
-    });
-}
-
-#[test]
-fn scoped_backend_errors_keep_their_retryability() {
-    block_on(async {
-        let scope = ScopedKvStore::new(RogueStore, b"p/".to_vec());
-        let err = scope.get(b"k").await.expect_err("backend fails");
-
-        assert_eq!(err, ScopedKvError::Backend(RogueError));
-        assert!(
-            err.is_retryable(),
-            "wrapping must not erase the backend's own answer"
-        );
-    });
-}
-
-#[test]
-fn scoped_clear_range_cannot_detect_a_backend_that_over_deletes() {
-    block_on(async {
-        let mut tx = open_transaction();
-        tx.set(b"p/inside", b"inside").await.expect("seed scope");
-        tx.set(b"foreign/outside", b"outside")
-            .await
-            .expect("seed foreign");
-
-        let rogue = OverDeletingStore { inner: tx };
-        let mut scope = ScopedKvStore::new(rogue, b"p/".to_vec());
-        scope
-            .clear_range(Bound::Unbounded, Bound::Unbounded)
-            .await
-            .expect("backend reports success");
-
-        // The rogue backend ignored the scoped bounds and cleared the foreign
-        // key too. The scoped wrapper cannot detect it — the view is simply
-        // empty now.
-        let inner = scope.into_inner();
-        let pairs = scan_all(&inner, false).await;
-        assert!(
-            pairs.is_empty(),
-            "the scoped wrapper cannot verify a keyless clear-range response"
-        );
     });
 }
 
@@ -938,50 +955,38 @@ fn arb_entries() -> impl Strategy<Value = BTreeMap<Vec<u8>, Vec<u8>>> {
     prop::collection::btree_map(arb_key(), arb_value(), 0..8)
 }
 
-/// Two prefixes where neither is a prefix of the other.
-///
-/// Nesting is a deliberate feature ([`ScopedKvStore::scoped`]), so a scope
-/// under another scope's prefix is *supposed* to see the parent's keys.
-/// Isolation is only claimed for genuinely disjoint namespaces, and the empty
-/// prefix — a prefix of everything — is excluded by the same filter.
-fn arb_disjoint_prefixes() -> impl Strategy<Value = (Vec<u8>, Vec<u8>)> {
-    (arb_key(), arb_key()).prop_filter("neither prefix may contain the other", |(a, b)| {
-        !a.starts_with(b) && !b.starts_with(a)
-    })
-}
-
 proptest! {
     // Each case builds a store and runs several scans.
     #![proptest_config(ProptestConfig::with_cases(64))]
 
-    /// A scope is a faithful view of the map written through it: what goes in
-    /// comes back out, point reads and full scans agree, and the scan order is
-    /// the store's lexicographic order in both directions.
+    /// A scope is a faithful view of the directory written through it: what
+    /// goes in comes back out, point reads and full scans agree, and the scan
+    /// order is the store's lexicographic order in both directions.
     #[test]
     fn prop_scope_round_trips_every_entry(
-        prefix in arb_key(),
+        pin in arb_dir(),
         entries in arb_entries(),
     ) {
         block_on(async {
-            let mut scope = ScopedKvStore::new(open_store().transaction(), prefix.clone());
+            let mut scope = ScopedKvStore::new(open_transaction(), pin.clone());
             for (key, value) in &entries {
-                scope.set(key, value).await.expect("set must succeed");
+                scope.set(&[], key, value).await.expect("set must succeed");
             }
 
             for (key, value) in &entries {
-                let stored = scope.get(key).await.expect("get must succeed");
-                prop_assert_eq!(stored.as_ref(), Some(value));
-                prop_assert!(scope.exists(key).await.expect("exists must succeed"));
+                let stored = scope.get(&[], key).await.expect("get must succeed");
+                prop_assert_eq!(stored, Some(value.clone()));
+                prop_assert!(scope.exists(&[], key).await.expect("exists must succeed"));
             }
 
-            let forward = scan_all(&scope, false).await;
+            let forward = scan_all(&scope, &[], false).await;
             let expected: Vec<(Vec<u8>, Vec<u8>)> = entries
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
             prop_assert_eq!(&forward, &expected);
 
-            let mut reversed = scan_all(&scope, true).await;
+            let mut reversed = scan_all(&scope, &[], true).await;
             reversed.reverse();
             prop_assert_eq!(&reversed, &expected);
 
@@ -989,151 +994,54 @@ proptest! {
         })?;
     }
 
-    /// Operations through the `KvStore` surface prefix every caller key before
-    /// handing it to the backend.
+    /// Two scopes pinned to the same base with different pins cannot see each
+    /// other's keys — including a wholesale `clear_range` at one pin, which
+    /// must not reach past its directory.
     #[test]
-    fn prop_backend_keys_are_all_prefixed(
-        prefix in arb_key(),
-        entries in arb_entries(),
-    ) {
-        block_on(async {
-            let mut scope = ScopedKvStore::new(open_store().transaction(), prefix.clone());
-            for (key, value) in &entries {
-                scope.set(key, value).await.expect("set must succeed");
-            }
-
-            // The transaction's merged view holds exactly the prefixed keys.
-            let backend = scope.into_inner();
-            let raw: Vec<(Vec<u8>, Vec<u8>)> = scan_all(&backend, false).await;
-            let raw_keys: Vec<Vec<u8>> = raw.into_iter().map(|(key, _)| key).collect();
-            let expected: Vec<Vec<u8>> = entries
-                .keys()
-                .map(|key| {
-                    let mut full = prefix.clone();
-                    full.extend_from_slice(key);
-                    full
-                })
-                .collect();
-            prop_assert_eq!(raw_keys, expected);
-            Ok(())
-        })?;
-    }
-
-    /// Writes through one scope are invisible to a disjoint one — including a
-    /// wholesale `clear_range`, which must not reach past its namespace.
-    #[test]
-    fn prop_disjoint_scopes_cannot_see_each_other(
-        (first_prefix, second_prefix) in arb_disjoint_prefixes(),
+    fn prop_disjoint_pins_cannot_see_each_other(
+        pin_a in arb_dir(),
+        pin_b in arb_dir(),
         first_entries in arb_entries(),
         second_entries in arb_entries(),
     ) {
+        prop_assume!(pin_a != pin_b);
         block_on(async {
-            let mut first = ScopedKvStore::new(open_store().transaction(), first_prefix.clone());
+            let mut first = ScopedKvStore::new(open_transaction(), pin_a.clone());
             for (key, value) in &first_entries {
-                first.set(key, value).await.expect("set must succeed");
+                first.set(&[], key, value).await.expect("set must succeed");
             }
 
             // Both scopes share one transaction (one rollback unit); the
-            // scoped bounds are what confine each scope's visibility.
-            let mut second = ScopedKvStore::new(first.into_inner(), second_prefix.clone());
+            // directory pins are what confine each scope's visibility.
+            let mut second = ScopedKvStore::new(first.into_inner(), pin_b.clone());
             for (key, value) in &second_entries {
-                second.set(key, value).await.expect("set must succeed");
+                second.set(&[], key, value).await.expect("set must succeed");
             }
 
             // The second scope sees exactly its own writes, whatever the
             // first one put in the same transaction.
-            let seen = scan_all(&second, false).await;
+            let seen = scan_all(&second, &[], false).await;
             let expected: Vec<(Vec<u8>, Vec<u8>)> = second_entries
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
             prop_assert_eq!(seen, expected);
 
-            // Clearing the second namespace wholesale leaves the first intact.
+            // Clearing the second directory wholesale leaves the first
+            // intact.
             second
-                .clear_range(Bound::Unbounded, Bound::Unbounded)
+                .clear_range(&[], Bound::Unbounded, Bound::Unbounded)
                 .await
                 .expect("clear must succeed");
 
-            let first = ScopedKvStore::new(second.into_inner(), first_prefix.clone());
-            let survivors = scan_all(&first, false).await;
+            let first = ScopedKvStore::new(second.into_inner(), pin_a.clone());
+            let survivors = scan_all(&first, &[], false).await;
             let expected: Vec<(Vec<u8>, Vec<u8>)> = first_entries
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
             prop_assert_eq!(survivors, expected);
 
-            Ok(())
-        })?;
-    }
-}
-
-// ============================================================================
-// Key-space vs scoped-store agreement
-// ============================================================================
-
-/// A prefix together with backend contents concentrated around it.
-fn arb_prefix_and_entries() -> impl Strategy<Value = (Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>)> {
-    arb_key().prop_flat_map(|prefix| {
-        let entries = prop::collection::btree_map(arb_key_near(prefix.clone()), arb_value(), 0..8);
-        (Just(prefix), entries)
-    })
-}
-
-/// A key from a prefix's neighbourhood: the prefix itself, an extension of it,
-/// or an unrelated key.
-fn arb_key_near(prefix: Vec<u8>) -> impl Strategy<Value = Vec<u8>> {
-    let extension = (Just(prefix.clone()), arb_key()).prop_map(|(mut key, tail)| {
-        key.extend_from_slice(&tail);
-        key
-    });
-    prop_oneof![1 => extension, 2 => arb_key()]
-}
-
-proptest! {
-    // Each case builds a store and runs two scans; 64 is enough to cover the
-    // prefix relationships the alphabet can produce.
-    #![proptest_config(ProptestConfig::with_cases(64))]
-
-    /// The keyspace helpers and [`ScopedKvStore`] must agree, because the
-    /// scoped store *is* the production consumer of these bounds. Scanning the
-    /// backend over `prefix_range(p)` has to return exactly what a scope at
-    /// `p` reports, prefix re-attached.
-    #[test]
-    fn prop_prefix_range_agrees_with_the_scoped_store(
-        (prefix, entries) in arb_prefix_and_entries(),
-    ) {
-        block_on(async {
-            let mut tx = open_transaction();
-            for (key, value) in &entries {
-                tx.set(key, value).await.expect("seed must succeed");
-            }
-
-            let (start, end) = fasm_storage::prefix_range(&prefix);
-            let via_bounds: Vec<Vec<u8>> = tx
-                .range(bound_as_slice(&start), bound_as_slice(&end), false)
-                .collect()
-                .await
-                .expect("scan must succeed")
-                .into_iter()
-                .map(|pair| pair.key)
-                .collect();
-
-            let scope = ScopedKvStore::new(tx, prefix.clone());
-            let via_scope: Vec<Vec<u8>> = scope
-                .range(Bound::Unbounded, Bound::Unbounded, false)
-                .collect()
-                .await
-                .expect("scoped scan must succeed")
-                .into_iter()
-                .map(|pair| {
-                    let mut full = prefix.clone();
-                    full.extend_from_slice(&pair.key);
-                    full
-                })
-                .collect();
-
-            prop_assert_eq!(via_bounds, via_scope);
             Ok(())
         })?;
     }

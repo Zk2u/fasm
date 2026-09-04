@@ -15,7 +15,6 @@ fdb-storage-tests = []
 
 [dependencies]
 fasm-storage.workspace = true
-async-trait.workspace = true
 thiserror.workspace = true
 # `embedded-fdb-include` embeds the FDB C headers so the crate compiles without a
 # system FDB install; `fdb-7_3` pins the FDB API version.

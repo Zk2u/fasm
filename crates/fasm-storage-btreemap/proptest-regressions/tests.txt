@@ -6,3 +6,6 @@
 # everyone who runs the test benefits from these saved cases.
 cc f293096bf6cd6abafdf51e3b4c3789700931f43ea5960d930a17c2a6b574df8e # shrinks to prefix = [], entries = {[]: [], [255]: []}
 cc 66767310ca1c76f262fe6325c701acaa7283c5a33c855a82f29d7a07c756cb50 # shrinks to ops = [Set([], []), Set([255], [])], query = (Unbounded, Unbounded)
+cc bae8db3426bfb0bb2aed4b880792ac603b06728fce3fbbdc79732860329ce21c # shrinks to pin_a = [[128]], pin_b = [], first_entries = {}, second_entries = {}
+cc 07272cf41ba4f764434e733993a0b03954cb05f175f376f92833fa73c9f2e205 # shrinks to ops = [Set([], [255], []), ClearRange([], Excluded([]), Unbounded)], query_dir = [], query = (Unbounded, Unbounded)
+cc 8d55c0320b6d199814f9cf15eaef90f2eeec35dc6b55c3381c14324963e0292b # shrinks to ops = [Set([], [255, 255], [])], query_dir = [], query = (Unbounded, Included([]))
