@@ -28,6 +28,11 @@ jobs:
   verify-version:
     name: Verify tag and manifest version
     runs-on: ubuntu-latest
+    # The publish jobs consume these; without a job-level mapping the
+    # step outputs never leave this job and $CRATE resolves empty.
+    outputs:
+      crate: ${{ steps.tag.outputs.crate }}
+      version: ${{ steps.tag.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.2
@@ -106,13 +111,16 @@ jobs:
         run: >
           cargo doc --no-deps
           -p fasm-storage -p fasm-storage-btreemap -p fasm-storage-redb -p fasm-storage-fdb
+          -p fasm-storage-indexeddb
         env:
           RUSTDOCFLAGS: -D warnings
 
   publish-dry-run:
     name: Publish (dry run)
     runs-on: ubuntu-latest
-    needs: [test, doc]
+    # verify-version must be a direct dependency: the needs context
+    # only exposes outputs of jobs named in this list.
+    needs: [verify-version, test, doc]
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.2
@@ -126,7 +134,7 @@ jobs:
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
-    needs: publish-dry-run
+    needs: [verify-version, publish-dry-run]
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.2

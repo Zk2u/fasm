@@ -30,7 +30,9 @@ license = "MIT OR Apache-2.0"
 publish = true
 
 [workspace.dependencies]
-fasm-storage = { path = "crates/fasm-storage" }
+# The version key is required to publish dependents: cargo strips the
+# path and keeps the version in the uploaded manifest.
+fasm-storage = { path = "crates/fasm-storage", version = "0.1.0" }
 fasm-storage-btreemap = { path = "crates/fasm-storage-btreemap" }
 fasm-storage-redb = { path = "crates/fasm-storage-redb" }
 fasm-storage-fdb = { path = "crates/fasm-storage-fdb" }
