@@ -208,6 +208,32 @@ async fn dropping_polled_commit_future_still_commits() -> Result<(), IndexedDbEr
 }
 
 #[wasm_bindgen_test]
+async fn commit_round_trips_adversarial_bytes() -> Result<(), IndexedDbError> {
+    let name = unique_name("adversarial-bytes");
+    let store = IndexedDbStore::open(&name).await?;
+
+    let empty_key: &[u8] = b"";
+    let ff_key = vec![0xFFu8; 64];
+    let nul_key = vec![0x00u8, 0xFF, 0x00];
+    let nul_value = vec![0x00u8; 32];
+    let mixed_value: Vec<u8> = (0..=u8::MAX).collect();
+
+    let mut session = store.transaction().await?;
+    session.set(&[], empty_key, &mixed_value).await?;
+    session.set(&[], &ff_key, &nul_value).await?;
+    session.set(&[b"dir"], &nul_key, b"").await?;
+    session.commit().await?;
+
+    let reader = store.reader().await?;
+    assert_eq!(reader.get(&[], empty_key).await?, Some(mixed_value));
+    assert_eq!(reader.get(&[], &ff_key).await?, Some(nul_value));
+    assert_eq!(reader.get(&[b"dir"], &nul_key).await?, Some(Vec::new()));
+    drop(reader);
+    drop(store);
+    IndexedDbStore::delete(&name).await
+}
+
+#[wasm_bindgen_test]
 async fn scoped_commit_forwards_to_indexeddb_session() -> Result<(), IndexedDbError> {
     let name = unique_name("scoped-commit");
     let store = IndexedDbStore::open(&name).await?;
@@ -481,8 +507,9 @@ async fn partial_enqueue_with_failed_abort_has_unknown_outcome() -> Result<(), I
     assert!(!error.is_retryable());
     assert_eq!(raw_value(&store, &raw_a).await?, Some(b"written".to_vec()));
     assert_eq!(raw_value(&store, &raw_k).await?, None);
-    // The data key was queued before the layout metadata. PR 13 treats a
-    // missing version as fresh, so the orphan raw row is not visible via KvStore.
+    // The data key was queued before the layout metadata. The flat layer
+    // treats a missing layout version as a fresh database, so the orphan raw
+    // row is not visible via KvStore.
     assert_eq!(store.reader().await?.get(&[], b"a").await?, None);
     assert_eq!(revision(&store).await?, Revision::ZERO);
     drop(store);
