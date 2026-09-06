@@ -96,7 +96,11 @@ jobs:
       - name: Workspace tests
         run: cargo test --workspace
       - name: FDB backend tests
-        run: cargo test -p fasm-storage-fdb --features fdb-storage-tests
+        # Single-threaded: the binary shares one live cluster, and the
+        # root-level nav suite asserts exact root listings against a
+        # baseline captured at each test's start — a parallel test's
+        # commit could otherwise land inside that window.
+        run: cargo test -p fasm-storage-fdb --features fdb-storage-tests -- --test-threads=1
 
   doc:
     name: Documentation
