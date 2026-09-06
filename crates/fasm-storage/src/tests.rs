@@ -495,6 +495,20 @@ mod browser_contract {
         let stream: KvStream<'static, FlatError<TestErr>> = KvStream::empty();
         let _ = stream.collect().await;
 
+        // `KvStream::new` and `KvStream::failed` accept `!Send` captures in
+        // the browser: the `Rc`s below compile only under the browser form of
+        // `MaybeSend`, so a reintroduced hard `Send` bound on either
+        // constructor fails this build.
+        let anchor = Rc::new(());
+        let held: KvStream<'static, FlatError<TestErr>> = KvStream::new(async move {
+            drop(anchor);
+            Ok(None)
+        });
+        let _ = held.collect().await;
+
+        let deferred: KvStream<'static, Rc<TestErr>> = KvStream::failed(Rc::new(TestErr));
+        let _ = deferred.collect().await;
+
         let _ = scoped.commit().await;
     }
 
